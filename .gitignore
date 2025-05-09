@@ -2,3 +2,5 @@ data/
 result/
 .venv/
 .env
+
+__pycache__/

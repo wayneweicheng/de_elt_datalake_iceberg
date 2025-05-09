@@ -29,7 +29,7 @@ default_args = {
 # Get environment variables from Airflow Variables
 # These can be set in the Airflow UI or using the CLI
 GCP_PROJECT_ID = Variable.get('GCP_PROJECT_ID', 'climate-data-lake-iceberg')
-GCP_REGION = Variable.get('GCP_REGION', 'us-central1')
+GCP_REGION = Variable.get('GCP_REGION', 'australia-southeast1')
 RAW_BUCKET = Variable.get('RAW_BUCKET', 'climate-lake-raw-data')
 ICEBERG_CATALOG_BUCKET = Variable.get('ICEBERG_CATALOG_BUCKET', 'climate-lake-iceberg-catalog')
 ICEBERG_TABLES_BUCKET = Variable.get('ICEBERG_TABLES_BUCKET', 'climate-lake-iceberg-tables')

@@ -3,7 +3,7 @@
 batch_loader.py - Batch extraction and loading of historical climate data
 
 This script downloads and processes historical climate data from NOAA sources,
-and loads it into Iceberg tables in a Google Cloud Storage data lake.
+and loads it into Iceberg tables in Amazon S3 with AWS Glue/Athena.
 """
 
 import os
@@ -28,8 +28,6 @@ import requests
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
-from google.cloud import storage
-from pyiceberg.catalog import load_catalog
 from dotenv import load_dotenv
 
 # Configure logging
@@ -39,6 +37,15 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
+
+# Try to import boto3 for AWS - will fail gracefully if not available
+try:
+    import boto3
+    HAS_BOTO3 = True
+except ImportError:
+    logger.warning("boto3 is not installed or could not be imported. "
+                  "Run 'pip install boto3' to install.")
+    HAS_BOTO3 = False
 
 
 def load_env_vars() -> None:
@@ -57,47 +64,87 @@ def load_env_vars() -> None:
         logging.getLogger().setLevel(numeric_level)
 
 
-def init_gcs_client() -> storage.Client:
-    """Initialize Google Cloud Storage client"""
+def init_s3_client():
+    """Initialize Amazon S3 client"""
+    if not HAS_BOTO3:
+        logger.error("boto3 is not available, cannot initialize S3 client")
+        return None
+    
     try:
-        storage_client = storage.Client()
-        return storage_client
+        aws_region = os.getenv("AWS_REGION", "ap-southeast-2")
+        s3_client = boto3.client('s3', region_name=aws_region)
+        return s3_client
     except Exception as e:
-        logger.error(f"Error initializing GCS client: {e}")
+        logger.error(f"Error initializing S3 client: {e}")
         raise
 
 
-def init_iceberg_catalog() -> Any:
-    """Initialize Iceberg catalog"""
+def init_athena_client():
+    """Initialize AWS Athena client"""
+    if not HAS_BOTO3:
+        logger.error("boto3 is not available, cannot initialize Athena client")
+        return None
+    
     try:
-        # Get catalog name and configuration from environment variables
-        catalog_name = os.getenv("CATALOG_NAME", "climate_catalog")
-        catalog_config = {
-            "type": "rest",
-            "uri": f"gs://{os.getenv('ICEBERG_CATALOG_BUCKET', 'climate-lake-iceberg-catalog')}",
-            "warehouse": f"gs://{os.getenv('ICEBERG_TABLES_BUCKET', 'climate-lake-iceberg-tables')}",
-            "credential": "gcp",
-            "region": os.getenv("GCP_REGION", "us-central1")
-        }
+        aws_region = os.getenv("AWS_REGION", "ap-southeast-2")
+        athena_client = boto3.client('athena', region_name=aws_region)
+        return athena_client
+    except Exception as e:
+        logger.error(f"Error initializing Athena client: {e}")
+        raise
+
+
+def start_query_execution(athena_client, query, database, workgroup="primary"):
+    """Execute a query in Athena"""
+    try:
+        # Get S3 bucket for query results
+        results_bucket = os.getenv('ATHENA_RESULTS_BUCKET', os.getenv('RAW_BUCKET', 'climate-lake-raw-data'))
         
-        # Load the catalog
-        iceberg_catalog = load_catalog(catalog_name, **catalog_config)
-        return iceberg_catalog
+        response = athena_client.start_query_execution(
+            QueryString=query,
+            QueryExecutionContext={
+                'Database': database
+            },
+            ResultConfiguration={
+                'OutputLocation': f's3://{results_bucket}/athena-results/'
+            },
+            WorkGroup=workgroup
+        )
+        return response['QueryExecutionId']
     except Exception as e:
-        logger.error(f"Error initializing Iceberg catalog: {e}")
+        logger.error(f"Error starting Athena query: {e}")
         raise
 
 
-def download_and_upload_to_gcs(url: str, bucket_name: str, blob_name: str, 
-                              storage_client: storage.Client) -> bytes:
+def wait_for_query_to_complete(athena_client, query_execution_id):
+    """Wait for an Athena query to complete"""
+    while True:
+        response = athena_client.get_query_execution(
+            QueryExecutionId=query_execution_id
+        )
+        state = response['QueryExecution']['Status']['State']
+        
+        if state in ['SUCCEEDED', 'FAILED', 'CANCELLED']:
+            if state == 'FAILED':
+                error_message = response['QueryExecution']['Status'].get('StateChangeReason', 'Unknown error')
+                logger.error(f"Query failed: {error_message}")
+                raise Exception(f"Athena query failed: {error_message}")
+            return state
+        
+        logger.info(f"Query is {state}, waiting...")
+        time.sleep(5)
+
+
+def download_and_upload_to_s3(url: str, bucket_name: str, key_name: str, 
+                             s3_client) -> bytes:
     """
-    Download data from URL and upload to GCS bucket
+    Download data from URL and upload to S3 bucket
     
     Args:
         url: URL to download data from
-        bucket_name: GCS bucket name
-        blob_name: GCS blob name
-        storage_client: Initialized GCS client
+        bucket_name: S3 bucket name
+        key_name: S3 key name
+        s3_client: Initialized S3 client
         
     Returns:
         Content of the downloaded file as bytes
@@ -107,22 +154,97 @@ def download_and_upload_to_gcs(url: str, bucket_name: str, blob_name: str,
         response = requests.get(url, timeout=30)
         response.raise_for_status()
         
-        logger.info(f"Upload to gs://{bucket_name}/{blob_name}")
-        bucket = storage_client.bucket(bucket_name)
-        blob = bucket.blob(blob_name)
-        blob.upload_from_string(response.content)
-        logger.info(f"Uploaded to gs://{bucket_name}/{blob_name}")
+        logger.info(f"Upload to s3://{bucket_name}/{key_name}")
+        s3_client.put_object(
+            Bucket=bucket_name,
+            Key=key_name,
+            Body=response.content
+        )
+        logger.info(f"Uploaded to s3://{bucket_name}/{key_name}")
         
         return response.content
     except requests.exceptions.RequestException as e:
         logger.error(f"Error downloading from {url}: {e}")
         raise
     except Exception as e:
-        logger.error(f"Error uploading to GCS: {e}")
+        logger.error(f"Error uploading to S3: {e}")
         raise
 
 
-def process_stations_data() -> pd.DataFrame:
+def insert_into_stations_table(stations_df: pd.DataFrame, namespace: str, athena_client) -> None:
+    """
+    Insert data into stations Iceberg table using Athena
+    
+    Args:
+        stations_df: DataFrame containing stations data
+        namespace: Database namespace
+        athena_client: AWS Athena client
+    """
+    try:
+        # Create a temporary directory for processing
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Write to temporary Parquet file
+            parquet_file = os.path.join(tmpdir, "stations.parquet")
+            table = pa.Table.from_pandas(stations_df)
+            pq.write_table(table, parquet_file)
+            
+            # Upload to S3
+            raw_bucket = os.getenv("RAW_BUCKET", "climate-lake-raw-data")
+            s3_client = init_s3_client()
+            s3_key = f"raw/stations/stations_{int(time.time())}.parquet"
+            
+            with open(parquet_file, 'rb') as f:
+                s3_client.put_object(
+                    Bucket=raw_bucket,
+                    Key=s3_key,
+                    Body=f
+                )
+            
+            # Create a temporary table to hold the data
+            temp_table_name = f"temp_stations_{int(time.time())}"
+            create_temp_table_query = f"""
+            CREATE EXTERNAL TABLE {namespace}.{temp_table_name} (
+                station_id STRING,
+                name STRING,
+                latitude DOUBLE,
+                longitude DOUBLE,
+                elevation DOUBLE,
+                country STRING,
+                state STRING,
+                first_year INT,
+                last_year INT
+            )
+            ROW FORMAT SERDE 'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe'
+            STORED AS INPUTFORMAT 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat'
+            OUTPUTFORMAT 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat'
+            LOCATION 's3://{raw_bucket}/raw/stations/'
+            """
+            
+            query_id = start_query_execution(athena_client, create_temp_table_query, namespace)
+            wait_for_query_to_complete(athena_client, query_id)
+            
+            # Insert the data into the Iceberg table
+            insert_query = f"""
+            INSERT INTO {namespace}.stations
+            SELECT * FROM {namespace}.{temp_table_name}
+            """
+            
+            query_id = start_query_execution(athena_client, insert_query, namespace)
+            wait_for_query_to_complete(athena_client, query_id)
+            
+            # Drop the temporary table
+            drop_query = f"DROP TABLE IF EXISTS {namespace}.{temp_table_name}"
+            query_id = start_query_execution(athena_client, drop_query, namespace)
+            wait_for_query_to_complete(athena_client, query_id)
+            
+            logger.info(f"Inserted {len(stations_df)} stations into Iceberg table")
+            
+    except Exception as e:
+        logger.error(f"Error inserting into stations table: {e}")
+        raise
+
+
+def process_stations_data():
     """
     Process GHCN stations data and load to Iceberg
     
@@ -130,7 +252,7 @@ def process_stations_data() -> pd.DataFrame:
         DataFrame containing stations data
     """
     try:
-        logger.info("Processing stations data...")
+        logging.info("Processing stations data...")
         
         # Get environment variables
         raw_bucket = os.getenv("RAW_BUCKET", "climate-lake-raw-data")
@@ -138,15 +260,19 @@ def process_stations_data() -> pd.DataFrame:
                                      "https://www1.ncdc.noaa.gov/pub/data/ghcn/daily/ghcnd-stations.txt")
         
         # Initialize clients
-        storage_client = init_gcs_client()
-        iceberg_catalog = init_iceberg_catalog()
+        s3_client = init_s3_client()
+        athena_client = init_athena_client()
+        
+        if s3_client is None or athena_client is None:
+            logging.error("Failed to initialize required AWS clients")
+            sys.exit(1)
         
         # Download stations data
-        content = download_and_upload_to_gcs(
+        content = download_and_upload_to_s3(
             ghcn_stations_url, 
             raw_bucket, 
             "ghcn/stations/ghcnd-stations.txt",
-            storage_client
+            s3_client
         )
         
         # Parse fixed-width format
@@ -157,48 +283,159 @@ def process_stations_data() -> pd.DataFrame:
                 continue
             
             try:
+                # Extract fields with proper type handling
+                station_id = line[0:11].strip()
+                # Ensure name is processed as a string
+                name = line[41:71].strip()
+                
+                # These are numeric fields
+                try:
+                    latitude = float(line[12:20].strip() or 0)
+                    longitude = float(line[21:30].strip() or 0)
+                    elevation = float(line[31:37].strip() or 0)
+                except ValueError:
+                    logging.warning(f"Skipping line with invalid numeric data: {line.strip()}")
+                    continue
+                
+                # Extract country and state fields
+                country = line[38:40].strip()
+                
+                # For US stations, get the state code from positions 71-73
+                if country == 'US':
+                    state = line[71:73].strip()
+                else:
+                    state = ""  # Empty string for non-US stations
+                
+                # Parse the first and last years if present
+                try:
+                    first_year = int(line[74:78].strip() or "0")
+                    last_year = int(line[79:83].strip() or "0")
+                except ValueError as e:
+                    # Log the error and skip this record
+                    logging.warning(f"Error parsing line: {line.strip()}. Error: {e}")
+                    continue
+                
                 stations_data.append({
-                    'station_id': line[0:11].strip(),
-                    'latitude': float(line[12:20].strip() or 0),
-                    'longitude': float(line[21:30].strip() or 0),
-                    'elevation': float(line[31:37].strip() or 0),
-                    'name': line[41:71].strip(),
-                    'country': line[38:40].strip(),
-                    'state': line[38:40].strip() if line[38:40].strip() == 'US' else '',
-                    'first_year': int(line[74:79].strip() or 0),
-                    'last_year': int(line[79:85].strip() or 0)
+                    'station_id': station_id,
+                    'name': name,
+                    'latitude': latitude,
+                    'longitude': longitude, 
+                    'elevation': elevation,
+                    'country': country,
+                    'state': state,
+                    'first_year': first_year,
+                    'last_year': last_year
                 })
-            except (ValueError, IndexError) as e:
-                logger.warning(f"Error parsing line: {line}. Error: {e}")
-                continue
+                
+            except Exception as e:
+                logging.warning(f"Error parsing line: {line.strip()}. Error: {e}")
         
-        # Create DataFrame
+        # Create DataFrame with columns in the specific order that matches the table schema
         df = pd.DataFrame(stations_data)
-        logger.info(f"Processed {len(df)} stations")
         
-        # Get Iceberg table
+        # Ensure the column order matches the target table schema exactly
+        # Expected order: station_id, name, latitude, longitude, elevation, country, state, first_year, last_year
+        column_order = ['station_id', 'name', 'latitude', 'longitude', 'elevation', 'country', 'state', 'first_year', 'last_year']
+        df = df[column_order]
+        
+        logging.info(f"Processed {len(df)} stations")
+        
+        # Get database namespace from environment
         namespace = os.getenv("NAMESPACE", "climate_data")
-        stations_table = iceberg_catalog.load_table(f"{namespace}.stations")
         
-        # Write to temporary Parquet file
-        with tempfile.NamedTemporaryFile(suffix='.parquet') as tmp:
-            table = pa.Table.from_pandas(df)
-            pq.write_table(table, tmp.name)
-            
-            # Upload to GCS
-            stations_blob_name = f"iceberg/stations/data/stations_{int(time.time())}.parquet"
-            bucket = storage_client.bucket(raw_bucket)
-            blob = bucket.blob(stations_blob_name)
-            blob.upload_from_filename(tmp.name)
+        # Insert into Iceberg table using Athena
+        insert_into_stations_table(df, namespace, athena_client)
         
-        # Register data with Iceberg
-        stations_table.append(f"gs://{raw_bucket}/{stations_blob_name}")
-        
-        logger.info(f"Loaded {len(df)} stations to Iceberg table")
         return df
         
     except Exception as e:
-        logger.error(f"Error processing stations data: {e}")
+        logging.error(f"Error processing stations data: {e}")
+        raise
+
+
+def process_observations_chunk(chunk_data: List[Dict], year: int, month: int, chunk_counter: int, namespace: str, s3_client, athena_client) -> None:
+    """
+    Process and load a chunk of observations data
+    
+    Args:
+        chunk_data: List of observation records
+        year: Year of the data
+        month: Month of the data
+        chunk_counter: Counter for the chunk
+        namespace: Database namespace
+        s3_client: AWS S3 client
+        athena_client: AWS Athena client
+    """
+    try:
+        # Create a temporary directory for processing
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create dataframe from chunk
+            chunk_df = pd.DataFrame(chunk_data)
+            
+            # Add partition columns if missing
+            if 'year' not in chunk_df.columns:
+                chunk_df['year'] = year
+            if 'month' not in chunk_df.columns:
+                chunk_df['month'] = month
+            
+            # Write to temporary parquet file
+            parquet_file = os.path.join(tmpdir, f"chunk_{chunk_counter}.parquet")
+            table = pa.Table.from_pandas(chunk_df)
+            pq.write_table(table, parquet_file)
+            
+            # Upload to S3
+            raw_bucket = os.getenv("RAW_BUCKET", "climate-lake-raw-data")
+            s3_key = f"raw/observations/year={year}/month={month}/chunk_{chunk_counter}_{int(time.time())}.parquet"
+            
+            with open(parquet_file, 'rb') as f:
+                s3_client.put_object(
+                    Bucket=raw_bucket,
+                    Key=s3_key,
+                    Body=f
+                )
+            
+            # Create a temporary table to hold the data
+            temp_table_name = f"temp_observations_{year}_{month}_{chunk_counter}_{int(time.time())}"
+            create_temp_table_query = f"""
+            CREATE EXTERNAL TABLE {namespace}.{temp_table_name} (
+                station_id STRING,
+                date DATE,
+                element STRING,
+                value DOUBLE,
+                measurement_flag STRING,
+                quality_flag STRING,
+                source_flag STRING,
+                observation_time STRING,
+                year INT,
+                month INT
+            )
+            ROW FORMAT SERDE 'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe'
+            STORED AS INPUTFORMAT 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat'
+            OUTPUTFORMAT 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat'
+            LOCATION 's3://{raw_bucket}/raw/observations/year={year}/month={month}/'
+            """
+            
+            query_id = start_query_execution(athena_client, create_temp_table_query, namespace)
+            wait_for_query_to_complete(athena_client, query_id)
+            
+            # Insert the data into the Iceberg table
+            insert_query = f"""
+            INSERT INTO {namespace}.observations
+            SELECT * FROM {namespace}.{temp_table_name}
+            """
+            
+            query_id = start_query_execution(athena_client, insert_query, namespace)
+            wait_for_query_to_complete(athena_client, query_id)
+            
+            # Drop the temporary table
+            drop_query = f"DROP TABLE IF EXISTS {namespace}.{temp_table_name}"
+            query_id = start_query_execution(athena_client, drop_query, namespace)
+            wait_for_query_to_complete(athena_client, query_id)
+            
+            logger.info(f"Inserted chunk {chunk_counter} with {len(chunk_data)} records into Iceberg table")
+            
+    except Exception as e:
+        logger.error(f"Error processing observations chunk: {e}")
         raise
 
 
@@ -223,15 +460,19 @@ def process_observations_data(year: int, stations_df: Optional[pd.DataFrame] = N
         chunk_size = int(os.getenv("CHUNK_SIZE", "10000"))
         
         # Initialize clients
-        storage_client = init_gcs_client()
-        iceberg_catalog = init_iceberg_catalog()
+        s3_client = init_s3_client()
+        athena_client = init_athena_client()
+        
+        if s3_client is None or athena_client is None:
+            logger.error("Failed to initialize required AWS clients")
+            sys.exit(1)
         
         # Download year data
         url = f"{ghcn_data_url}{year}.csv.gz"
         blob_name = f"ghcn/observations/by_year/{year}.csv.gz"
         
         try:
-            content = download_and_upload_to_gcs(url, raw_bucket, blob_name, storage_client)
+            content = download_and_upload_to_s3(url, raw_bucket, blob_name, s3_client)
             logger.info(f"Downloaded data for year {year}")
         except requests.exceptions.HTTPError as e:
             logger.error(f"Error downloading data for year {year}: {e}")
@@ -241,114 +482,92 @@ def process_observations_data(year: int, stations_df: Optional[pd.DataFrame] = N
         # This is helpful to limit the data volume for demonstration purposes
         filter_stations = stations_df is not None
         
+        # Get database namespace from environment
+        namespace = os.getenv("NAMESPACE", "climate_data")
+        
         # Process the CSV data
         # Format: station_id,date,element,value,m-flag,q-flag,s-flag,obs-time
         # Example: USC00045721,20150101,PRCP,0,,,P,
         
-        # Create a temporary directory for processing chunks
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Get Iceberg table
-            namespace = os.getenv("NAMESPACE", "climate_data")
-            observations_table = iceberg_catalog.load_table(f"{namespace}.observations")
+        # Process in chunks
+        processed_records = 0
+        chunk_counter = 0
+        chunk_data = []
+        
+        with gzip.open(io.BytesIO(content), 'rt') as f:
+            reader = csv.reader(f)
             
-            # Process in chunks and write each chunk as a separate file
-            parquet_files = []
-            
-            # Process the gzipped CSV
-            processed_records = 0
-            chunk_counter = 0
-            chunk_data = []
-            
-            with gzip.open(io.BytesIO(content), 'rt') as f:
-                reader = csv.reader(f)
-                
-                for row in reader:
-                    if len(row) < 8:  # Skip malformed rows
-                        continue
-                        
-                    # Filter by stations if needed
-                    if filter_stations and row[0] not in stations_df['station_id'].values:
-                        continue
-                        
-                    # Parse and validate date format (YYYYMMDD)
-                    try:
-                        date_str = row[1]
-                        date_obj = date(int(date_str[0:4]), int(date_str[4:6]), int(date_str[6:8]))
-                    except (ValueError, IndexError):
-                        continue
+            for row in reader:
+                if len(row) < 8:  # Skip malformed rows
+                    continue
                     
-                    # Add record to chunk
-                    chunk_data.append({
-                        'station_id': row[0],
-                        'date': date_obj,
-                        'element': row[2],
-                        'value': float(row[3]) / 10.0 if row[2] in ['TMIN', 'TMAX', 'TAVG', 'PRCP'] else float(row[3]),
-                        'measurement_flag': row[4] if row[4] else None,
-                        'quality_flag': row[5] if row[5] else None,
-                        'source_flag': row[6] if row[6] else None,
-                        'observation_time': row[7] if row[7] else None
-                    })
+                # Filter by stations if needed
+                if filter_stations and row[0] not in stations_df['station_id'].values:
+                    continue
                     
-                    processed_records += 1
+                # Parse and validate date format (YYYYMMDD)
+                try:
+                    date_str = row[1]
+                    year_val = int(date_str[0:4])
+                    month_val = int(date_str[4:6])
+                    day_val = int(date_str[6:8])
+                    date_obj = date(year_val, month_val, day_val)
+                except (ValueError, IndexError):
+                    continue
+                
+                # Add record to chunk
+                chunk_data.append({
+                    'station_id': row[0],
+                    'date': date_obj,
+                    'element': row[2],
+                    'value': float(row[3]) / 10.0 if row[2] in ['TMIN', 'TMAX', 'TAVG', 'PRCP'] else float(row[3]),
+                    'measurement_flag': row[4] if row[4] else None,
+                    'quality_flag': row[5] if row[5] else None,
+                    'source_flag': row[6] if row[6] else None,
+                    'observation_time': row[7] if row[7] else None,
+                    'year': year_val,
+                    'month': month_val
+                })
+                
+                processed_records += 1
+                
+                # When chunk is full or we've reached the max records, process the chunk
+                if len(chunk_data) >= chunk_size or processed_records >= max_records:
+                    # Process the chunk
+                    process_observations_chunk(
+                        chunk_data, 
+                        year, 
+                        chunk_data[0]['month'],  # Use month from first record in chunk
+                        chunk_counter, 
+                        namespace, 
+                        s3_client, 
+                        athena_client
+                    )
                     
-                    # When chunk is full or we've reached the max records, write to parquet
-                    if len(chunk_data) >= chunk_size or processed_records >= max_records:
-                        # Create dataframe from chunk
-                        chunk_df = pd.DataFrame(chunk_data)
-                        
-                        # Write to parquet
-                        parquet_file = os.path.join(tmpdir, f"chunk_{chunk_counter}.parquet")
-                        table = pa.Table.from_pandas(chunk_df)
-                        pq.write_table(table, parquet_file)
-                        
-                        # Upload to GCS
-                        parquet_blob_name = f"iceberg/observations/data/year={year}/chunk_{chunk_counter}_{int(time.time())}.parquet"
-                        bucket = storage_client.bucket(raw_bucket)
-                        blob = bucket.blob(parquet_blob_name)
-                        blob.upload_from_filename(parquet_file)
-                        parquet_files.append(f"gs://{raw_bucket}/{parquet_blob_name}")
-                        
-                        # Log progress
-                        logger.info(f"Processed chunk {chunk_counter} with {len(chunk_data)} records")
-                        
-                        # Reset for next chunk
-                        chunk_data = []
-                        chunk_counter += 1
-                        
-                    # If we've reached max records, stop
-                    if processed_records >= max_records:
-                        logger.info(f"Reached maximum records limit of {max_records}")
-                        break
-            
-            # Process any remaining data
-            if chunk_data:
-                # Create dataframe from chunk
-                chunk_df = pd.DataFrame(chunk_data)
-                
-                # Write to parquet
-                parquet_file = os.path.join(tmpdir, f"chunk_{chunk_counter}.parquet")
-                table = pa.Table.from_pandas(chunk_df)
-                pq.write_table(table, parquet_file)
-                
-                # Upload to GCS
-                parquet_blob_name = f"iceberg/observations/data/year={year}/chunk_{chunk_counter}_{int(time.time())}.parquet"
-                bucket = storage_client.bucket(raw_bucket)
-                blob = bucket.blob(parquet_blob_name)
-                blob.upload_from_filename(parquet_file)
-                parquet_files.append(f"gs://{raw_bucket}/{parquet_blob_name}")
-                
-                # Log progress
-                logger.info(f"Processed final chunk {chunk_counter} with {len(chunk_data)} records")
-                chunk_counter += 1
-            
-            # Register all parquet files with Iceberg
-            if parquet_files:
-                observations_table.append(parquet_files)
-                logger.info(f"Loaded {processed_records} observations to Iceberg table for year {year}")
-            else:
-                logger.warning(f"No observations were processed for year {year}")
-            
-            return processed_records
+                    # Reset for next chunk
+                    chunk_data = []
+                    chunk_counter += 1
+                    
+                # If we've reached max records, stop
+                if processed_records >= max_records:
+                    logger.info(f"Reached maximum records limit of {max_records}")
+                    break
+        
+        # Process any remaining data
+        if chunk_data:
+            process_observations_chunk(
+                chunk_data, 
+                year, 
+                chunk_data[0]['month'],  # Use month from first record in chunk
+                chunk_counter, 
+                namespace, 
+                s3_client, 
+                athena_client
+            )
+            chunk_counter += 1
+        
+        logger.info(f"Processed {processed_records} observations for year {year}")
+        return processed_records
             
     except Exception as e:
         logger.error(f"Error processing observations data for year {year}: {e}")

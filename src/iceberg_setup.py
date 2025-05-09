@@ -2,14 +2,15 @@
 """
 iceberg_setup.py - Sets up Apache Iceberg catalog and tables for climate data
 
-This script configures the Iceberg catalog on Google Cloud Storage and creates
+This script configures the Iceberg catalog on Amazon S3 and AWS Athena and creates
 the necessary tables for storing climate data (stations and observations).
 """
 
 import os
 import logging
 import argparse
-from typing import Dict, Any, Optional
+import time
+from typing import Dict, Any
 import sys
 from pathlib import Path
 
@@ -19,7 +20,6 @@ if parent_dir not in sys.path:
     sys.path.append(parent_dir)
 
 from dotenv import load_dotenv
-from pyiceberg.catalog import load_catalog
 
 # Configure logging
 logging.basicConfig(
@@ -28,6 +28,24 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
+
+# Try to import boto3 for AWS - will fail gracefully if not available
+try:
+    import boto3
+    HAS_BOTO3 = True
+except ImportError:
+    logger.warning("boto3 is not installed or could not be imported. "
+                  "Run 'pip install boto3' to install.")
+    HAS_BOTO3 = False
+
+# Try to import PyIceberg - will fail gracefully if not available
+try:
+    from pyiceberg.catalog import load_catalog
+    HAS_PYICEBERG = True
+except ImportError:
+    logger.warning("PyIceberg is not installed or could not be imported. "
+                  "Run 'pip install \"pyiceberg[s3,glue]<=0.9.1\"' to install.")
+    HAS_PYICEBERG = False
 
 
 def load_env_vars() -> None:
@@ -47,151 +65,101 @@ def load_env_vars() -> None:
 
 
 def create_catalog_config() -> Dict[str, str]:
-    """Create Iceberg catalog configuration from environment variables"""
+    """Create Iceberg catalog configuration for AWS Glue or local catalog"""
     try:
-        catalog_config = {
-            "type": "rest",
-            "uri": f"gs://{os.getenv('ICEBERG_CATALOG_BUCKET', 'climate-lake-iceberg-catalog')}",
-            "warehouse": f"gs://{os.getenv('ICEBERG_TABLES_BUCKET', 'climate-lake-iceberg-tables')}",
-            "credential": "gcp",
-            "region": os.getenv("GCP_REGION", "us-central1"),
+        # Default to using AWS Glue catalog
+        logger.info("Setting up AWS Glue catalog")
+        iceberg_tables_bucket = os.getenv('ICEBERG_TABLES_BUCKET', 'climate-lake-iceberg-tables')
+        aws_region = os.getenv("AWS_REGION", "ap-southeast-2")
+        
+        return {
+            "type": "glue",
+            "warehouse": f"s3://{iceberg_tables_bucket}",
+            "s3.region": aws_region
         }
-        return catalog_config
     except Exception as e:
         logger.error(f"Error creating catalog config: {e}")
         raise
 
 
-def setup_iceberg_catalog(catalog_name: str) -> Any:
-    """Create and configure Iceberg catalog"""
+def setup_aws_glue_client():
+    """Set up AWS Glue client for database operations"""
+    if not HAS_BOTO3:
+        logger.error("boto3 is not available, cannot set up AWS Glue client")
+        return None
+    
     try:
-        # Get credential path from environment variable
-        credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-        if credentials_path:
-            logger.info(f"Using credentials from {credentials_path}")
-            # Ensure the credentials path exists
-            if not os.path.exists(credentials_path):
-                logger.warning(f"Credentials file not found at {credentials_path}")
-        else:
-            logger.warning("GOOGLE_APPLICATION_CREDENTIALS environment variable not set")
-            
-        # Create catalog configuration
-        catalog_config = create_catalog_config()
-        logger.info(f"Setting up Iceberg catalog with config: {catalog_config}")
-        
-        # Load the catalog
-        iceberg_catalog = load_catalog(catalog_name, **catalog_config)
-        logger.info(f"Successfully loaded Iceberg catalog: {catalog_name}")
-        return iceberg_catalog
-        
+        aws_region = os.getenv("AWS_REGION", "ap-southeast-2")
+        glue_client = boto3.client('glue', region_name=aws_region)
+        return glue_client
     except Exception as e:
-        logger.error(f"Error setting up Iceberg catalog: {e}")
+        logger.error(f"Error setting up AWS Glue client: {e}")
+        return None
+
+
+def setup_aws_athena_client():
+    """Set up AWS Athena client for SQL operations"""
+    if not HAS_BOTO3:
+        logger.error("boto3 is not available, cannot set up AWS Athena client")
+        return None
+    
+    try:
+        aws_region = os.getenv("AWS_REGION", "ap-southeast-2")
+        athena_client = boto3.client('athena', region_name=aws_region)
+        return athena_client
+    except Exception as e:
+        logger.error(f"Error setting up AWS Athena client: {e}")
+        return None
+
+
+def start_query_execution(athena_client, query, database, workgroup="primary"):
+    """Execute a query in Athena"""
+    try:
+        # Get S3 bucket for query results
+        results_bucket = os.getenv('ATHENA_RESULTS_BUCKET', 'temp-analysis')
+        
+        response = athena_client.start_query_execution(
+            QueryString=query,
+            QueryExecutionContext={
+                'Database': database
+            },
+            ResultConfiguration={
+                'OutputLocation': f's3://{results_bucket}/athena-results/'
+            },
+            WorkGroup=workgroup
+        )
+        return response['QueryExecutionId']
+    except Exception as e:
+        logger.error(f"Error starting Athena query: {e}")
         raise
 
 
-def create_namespace(iceberg_catalog: Any, namespace: str) -> None:
-    """Create a namespace in the Iceberg catalog if it doesn't exist"""
-    try:
-        # Check if namespace already exists
-        namespaces = iceberg_catalog.list_namespaces()
-        if (namespace,) in namespaces:
-            logger.info(f"Namespace {namespace} already exists")
-        else:
-            # Create the namespace
-            logger.info(f"Creating namespace: {namespace}")
-            iceberg_catalog.create_namespace(namespace)
-            logger.info(f"Successfully created namespace: {namespace}")
-    except Exception as e:
-        logger.error(f"Error creating namespace {namespace}: {e}")
-        raise
-
-
-def define_stations_schema() -> Dict[str, Any]:
-    """Define schema for weather stations metadata"""
-    return {
-        "type": "struct",
-        "fields": [
-            {"id": 1, "name": "station_id", "type": "string", "required": True},
-            {"id": 2, "name": "name", "type": "string"},
-            {"id": 3, "name": "latitude", "type": "double"},
-            {"id": 4, "name": "longitude", "type": "double"},
-            {"id": 5, "name": "elevation", "type": "double"},
-            {"id": 6, "name": "country", "type": "string"},
-            {"id": 7, "name": "state", "type": "string"},
-            {"id": 8, "name": "first_year", "type": "int"},
-            {"id": 9, "name": "last_year", "type": "int"}
-        ]
-    }
-
-
-def define_observations_schema() -> Dict[str, Any]:
-    """Define schema for daily weather observations"""
-    return {
-        "type": "struct",
-        "fields": [
-            {"id": 1, "name": "station_id", "type": "string", "required": True},
-            {"id": 2, "name": "date", "type": "date", "required": True},
-            {"id": 3, "name": "element", "type": "string", "required": True},
-            {"id": 4, "name": "value", "type": "double"},
-            {"id": 5, "name": "measurement_flag", "type": "string"},
-            {"id": 6, "name": "quality_flag", "type": "string"},
-            {"id": 7, "name": "source_flag", "type": "string"},
-            {"id": 8, "name": "observation_time", "type": "timestamp"}
-        ]
-    }
-
-
-def create_table(iceberg_catalog: Any, namespace: str, table_name: str, 
-                schema: Dict[str, Any], partition_spec: Optional[list] = None,
-                properties: Optional[Dict[str, str]] = None) -> None:
-    """Create a table in the Iceberg catalog if it doesn't exist"""
-    try:
-        # Check if the table already exists
-        table_identifier = (namespace, table_name)
-        try:
-            iceberg_catalog.load_table(f"{namespace}.{table_name}")
-            logger.info(f"Table {namespace}.{table_name} already exists")
-            return
-        except Exception:
-            # Table doesn't exist, proceed with creation
-            pass
+def wait_for_query_to_complete(athena_client, query_execution_id):
+    """Wait for an Athena query to complete"""
+    while True:
+        response = athena_client.get_query_execution(
+            QueryExecutionId=query_execution_id
+        )
+        state = response['QueryExecution']['Status']['State']
         
-        # Set default properties if not provided
-        if properties is None:
-            properties = {
-                "format-version": "2",
-                "write.parquet.compression-codec": "zstd",
-                "write.metadata.compression-codec": "gzip"
-            }
-            
-        # Create the table
-        logger.info(f"Creating table: {namespace}.{table_name}")
-        if partition_spec:
-            logger.info(f"Using partition spec: {partition_spec}")
-            iceberg_catalog.create_table(
-                identifier=table_identifier,
-                schema=schema,
-                partition_spec=partition_spec,
-                properties=properties
-            )
-        else:
-            iceberg_catalog.create_table(
-                identifier=table_identifier,
-                schema=schema,
-                properties=properties
-            )
-        logger.info(f"Successfully created table: {namespace}.{table_name}")
-    except Exception as e:
-        logger.error(f"Error creating table {namespace}.{table_name}: {e}")
-        raise
+        if state in ['SUCCEEDED', 'FAILED', 'CANCELLED']:
+            if state == 'FAILED':
+                error_message = response['QueryExecution']['Status'].get('StateChangeReason', 'Unknown error')
+                logger.error(f"Query failed: {error_message}")
+                raise Exception(f"Athena query failed: {error_message}")
+            return state
+        
+        logger.info(f"Query is {state}, waiting...")
+        time.sleep(5)
 
 
 def main() -> None:
-    """Main function to set up Iceberg catalog and tables"""
+    """Main function to set up Iceberg catalog and tables with AWS Athena"""
     # Parse command line arguments
     parser = argparse.ArgumentParser(description="Set up Iceberg catalog and tables for climate data")
     parser.add_argument("--catalog", default=None, help="Name of the Iceberg catalog")
     parser.add_argument("--namespace", default=None, help="Namespace for the Iceberg tables")
+    parser.add_argument("--mock", action="store_true", help="Run in mock mode without requiring dependencies")
     args = parser.parse_args()
     
     # Load environment variables
@@ -201,52 +169,126 @@ def main() -> None:
     catalog_name = args.catalog or os.getenv("CATALOG_NAME", "climate_catalog")
     namespace = args.namespace or os.getenv("NAMESPACE", "climate_data")
     
+    # Check if we're in mock mode
+    if args.mock:
+        logger.info("Running in mock mode - skipping actual setup")
+        logger.info(f"Would create catalog: {catalog_name}")
+        logger.info(f"Would create namespace: {namespace}")
+        logger.info("Would create tables: stations, observations")
+        logger.info("Would use AWS Athena to create Iceberg tables")
+        return
+    
     try:
-        # Set up Iceberg catalog
-        iceberg_catalog = setup_iceberg_catalog(catalog_name)
+        # Set up AWS Glue client
+        glue_client = setup_aws_glue_client()
+        if glue_client is None:
+            logger.error("Failed to set up AWS Glue client. Make sure boto3 is installed and AWS credentials are configured.")
+            sys.exit(1)
+        logger.info("Successfully connected to AWS Glue Data Catalog")
         
-        # Create namespace
-        create_namespace(iceberg_catalog, namespace)
+        # Set up AWS Athena client
+        athena_client = setup_aws_athena_client()
+        if athena_client is None:
+            logger.error("Failed to set up AWS Athena client. Make sure boto3 is installed and AWS credentials are configured.")
+            sys.exit(1)
+        logger.info("Successfully connected to AWS Athena")
         
-        # Define schemas
-        stations_schema = define_stations_schema()
-        observations_schema = define_observations_schema()
+        # Create or get database in AWS Glue
+        try:
+            glue_client.get_database(Name=namespace)
+            logger.info(f"Database {namespace} already exists in AWS Glue")
+        except glue_client.exceptions.EntityNotFoundException:
+            logger.info(f"Creating database {namespace} in AWS Glue")
+            glue_client.create_database(
+                DatabaseInput={
+                    'Name': namespace,
+                    'Description': 'Climate data database for Iceberg tables',
+                }
+            )
+            logger.info(f"Successfully created database {namespace} in AWS Glue")
         
-        # Create tables
-        # Stations table
-        stations_table_properties = {
-            "format-version": "2",
-            "write.parquet.compression-codec": "zstd",
-            "write.metadata.compression-codec": "gzip"
-        }
-        create_table(
-            iceberg_catalog=iceberg_catalog,
-            namespace=namespace,
-            table_name="stations",
-            schema=stations_schema,
-            properties=stations_table_properties
+        # Get the S3 bucket for Iceberg tables
+        iceberg_tables_bucket = os.getenv('ICEBERG_TABLES_BUCKET', 'climate-lake-iceberg-tables')
+        
+        # Check and drop existing tables if they exist (to recreate them properly)
+        try:
+            logger.info("Checking if stations table exists...")
+            glue_client.get_table(DatabaseName=namespace, Name='stations')
+            logger.info("Stations table exists. Dropping to recreate as proper Iceberg table.")
+            # Drop using Athena
+            drop_query = f"DROP TABLE IF EXISTS {namespace}.stations"
+            query_id = start_query_execution(athena_client, drop_query, namespace)
+            wait_for_query_to_complete(athena_client, query_id)
+            logger.info("Successfully dropped stations table")
+        except glue_client.exceptions.EntityNotFoundException:
+            logger.info("Stations table doesn't exist yet")
+        
+        try:
+            logger.info("Checking if observations table exists...")
+            glue_client.get_table(DatabaseName=namespace, Name='observations')
+            logger.info("Observations table exists. Dropping to recreate as proper Iceberg table.")
+            # Drop using Athena
+            drop_query = f"DROP TABLE IF EXISTS {namespace}.observations"
+            query_id = start_query_execution(athena_client, drop_query, namespace)
+            wait_for_query_to_complete(athena_client, query_id)
+            logger.info("Successfully dropped observations table")
+        except glue_client.exceptions.EntityNotFoundException:
+            logger.info("Observations table doesn't exist yet")
+        
+        # Create stations table using Athena with Iceberg format
+        stations_query = """
+        CREATE TABLE IF NOT EXISTS {}.stations (
+           station_id STRING,
+           name STRING,
+           latitude DOUBLE,
+           longitude DOUBLE,
+           elevation DOUBLE,
+           country STRING,
+           state STRING,
+           first_year INT,
+           last_year INT
         )
-        
-        # Observations table with partitioning
-        observations_partitioning = [
-            {"name": "year", "transform": "year(date)"},
-            {"name": "month", "transform": "month(date)"}
-        ]
-        observations_table_properties = {
-            "format-version": "2",
-            "write.parquet.compression-codec": "zstd",
-            "write.metadata.compression-codec": "gzip"
-        }
-        create_table(
-            iceberg_catalog=iceberg_catalog,
-            namespace=namespace,
-            table_name="observations",
-            schema=observations_schema,
-            partition_spec=observations_partitioning,
-            properties=observations_table_properties
+        LOCATION '{}/stations/'
+        TBLPROPERTIES (
+           'table_type'='ICEBERG',
+           'format'='PARQUET'
         )
+        """.format(namespace, f"s3://{iceberg_tables_bucket}/{namespace}")
         
-        logger.info("Iceberg tables created successfully!")
+        logger.info("Creating stations table as Iceberg table in Athena")
+        stations_query_id = start_query_execution(athena_client, stations_query, namespace)
+        wait_for_query_to_complete(athena_client, stations_query_id)
+        logger.info("Successfully created stations table as Iceberg table")
+        
+        # Create observations table using Athena with Iceberg format
+        observations_query = """
+        CREATE TABLE IF NOT EXISTS {}.observations (
+           station_id STRING,
+           date DATE,
+           element STRING,
+           value DOUBLE,
+           measurement_flag STRING,
+           quality_flag STRING,
+           source_flag STRING,
+           observation_time TIMESTAMP,
+           year INT,
+           month INT
+        )
+        PARTITIONED BY (year, month)
+        LOCATION '{}/observations/'
+        TBLPROPERTIES (
+           'table_type'='ICEBERG',
+           'format'='PARQUET'
+        )
+        """.format(namespace, f"s3://{iceberg_tables_bucket}/{namespace}")
+        
+        logger.info("Creating observations table as Iceberg table in Athena")
+        observations_query_id = start_query_execution(athena_client, observations_query, namespace)
+        wait_for_query_to_complete(athena_client, observations_query_id)
+        logger.info("Successfully created observations table as Iceberg table")
+        
+        logger.info("Iceberg tables created successfully using AWS Athena!")
+        logger.info("You can now query these tables in Athena using SQL")
         
     except Exception as e:
         logger.error(f"Error setting up Iceberg: {e}")

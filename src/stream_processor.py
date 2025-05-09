@@ -75,7 +75,7 @@ def init_iceberg_catalog() -> Any:
             "uri": f"gs://{os.getenv('ICEBERG_CATALOG_BUCKET', 'climate-lake-iceberg-catalog')}",
             "warehouse": f"gs://{os.getenv('ICEBERG_TABLES_BUCKET', 'climate-lake-iceberg-tables')}",
             "credential": "gcp",
-            "region": os.getenv("GCP_REGION", "us-central1")
+            "region": os.getenv("GCP_REGION", "australia-southeast1")
         }
         
         # Load the catalog

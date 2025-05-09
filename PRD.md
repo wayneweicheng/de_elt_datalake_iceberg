@@ -1,8 +1,8 @@
 # Real-time Climate Data Analytics Platform with ELT
 
-This project implements a modern data lake architecture using Apache Iceberg on Google Cloud Platform (GCP). The focus is on Extract-Load-Transform (ELT) rather than ETL, leveraging BigQuery's powerful transformation capabilities while maintaining data lake flexibility with Iceberg.
+This project implements a modern data lake architecture using Apache Iceberg on Amazon Web Services (AWS). The focus is on Extract-Load-Transform (ELT) rather than ETL, leveraging Amazon Athena's powerful transformation capabilities while maintaining data lake flexibility with Iceberg.
 
-We'll use public climate data from NOAA to build a comprehensive data platform that showcases GCP services integration with Iceberg table format.
+We'll use public climate data from NOAA to build a comprehensive data platform that showcases AWS services integration with Iceberg table format.
 
 ### Solution Architecture Diagram
 
@@ -11,31 +11,31 @@ Here's the architecture diagram for our ELT data lake solution:
 ```mermaid
 graph TD
     %% Data Sources
-    NOAA["NOAA Climate Data APIs"] --> |Historical Data| CF["Cloud Functions\n(Batch Extraction)"]
-    RS["Real-time Sensors/Data"] --> |Streaming Events| PS["Cloud Pub/Sub"]
+    NOAA["NOAA Climate Data APIs"] --> |Historical Data| LF["AWS Lambda\n(Batch Extraction)"]
+    RS["Real-time Sensors/Data"] --> |Streaming Events| SNS["Amazon SNS"]
     
     %% Extract Layer
-    CF --> |Extract & Load| GCS["Google Cloud Storage\n(Raw Data)"]
-    PS --> |Trigger| CFPS["Cloud Functions\n(Stream Processing)"]
-    CFPS --> |Process & Load| GCS
+    LF --> |Extract & Load| S3["Amazon S3\n(Raw Data)"]
+    SNS --> |Trigger| LFS["AWS Lambda\n(Stream Processing)"]
+    LFS --> |Process & Load| S3
     
     %% Load/Storage Layer with Iceberg
-    GCS --> |Register with| IC["Apache Iceberg Catalog"]
+    S3 --> |Register with| IC["Apache Iceberg Catalog"]
     IC --> |Table Metadata| ICT["Iceberg Tables"]
     
     %% Transform Layer
-    ICT --> |External Tables| BQ["BigQuery\n(Transformation)"]
-    BQ --> |Create| Views["Analytical Views"]
-    BQ --> |Materialize| MT["Materialized Tables"]
+    ICT --> |External Tables| AT["Amazon Athena\n(Transformation)"]
+    AT --> |Create| Views["Analytical Views"]
+    AT --> |Materialize| MT["Materialized Tables"]
     
     %% Orchestration
-    CC["Cloud Composer\n(Airflow)"] --> |Orchestrate| CF
-    CC --> |Schedule| BQ
-    CC --> |Maintain| ICT
+    MWAA["Amazon MWAA\n(Airflow)"] --> |Orchestrate| LF
+    MWAA --> |Schedule| AT
+    MWAA --> |Maintain| ICT
     
     %% Analytics & Visualization
-    Views --> |Connect| LS["Looker Studio\n(Dashboards)"]
-    MT --> |Connect| LS
+    Views --> |Connect| QS["Amazon QuickSight\n(Dashboards)"]
+    MT --> |Connect| QS
     
     %% Styling
     classDef sources fill:#f9d29f,stroke:#333,stroke-width:1px
@@ -46,84 +46,88 @@ graph TD
     classDef analytics fill:#f1948a,stroke:#333,stroke-width:1px
     
     class NOAA,RS sources
-    class CF,CFPS,PS extract
-    class GCS,IC,ICT storage
-    class BQ,Views,MT transform
-    class CC orchestration
-    class LS analytics
+    class LF,LFS,SNS extract
+    class S3,IC,ICT storage
+    class AT,Views,MT transform
+    class MWAA orchestration
+    class QS analytics
 ```
 
 The architecture diagram illustrates our complete ELT data lake solution with the following components:
 
 1. Data Sources: NOAA Climate Data APIs for historical data and simulated real-time data sources
-2. Extract Layer: Cloud Functions for batch extraction and Pub/Sub with Cloud Functions for streaming data
-3. Load/Storage Layer: Raw data stored in Google Cloud Storage and registered with Apache Iceberg
-4. Transform Layer: BigQuery accesses Iceberg tables to create analytical views and materialized tables
-5. Orchestration: Cloud Composer (Airflow) coordinates all data processing activities
-6. Analytics & Visualization: Looker Studio connects to BigQuery for dashboarding and data exploration
+2. Extract Layer: AWS Lambda for batch extraction and Amazon SNS with Lambda for streaming data
+3. Load/Storage Layer: Raw data stored in Amazon S3 and registered with Apache Iceberg
+4. Transform Layer: Amazon Athena accesses Iceberg tables to create analytical views and materialized tables
+5. Orchestration: Amazon MWAA (Managed Workflows for Apache Airflow) coordinates all data processing activities
+6. Analytics & Visualization: Amazon QuickSight connects to Athena for dashboarding and data exploration
 
 ## Architecture Overview
 
 The project architecture follows modern data lake patterns with an ELT approach:
 
-1. Data Extraction: Pub/Sub for real-time data, Cloud Functions for batch extraction
-2. Loading: Direct loading into GCS data lake with Apache Iceberg format
-3. Transformation: BigQuery for in-place transformations
-4. Query Engine: BigQuery for analytics
-5. Orchestration: Cloud Composer (managed Airflow)
+1. Data Extraction: Amazon SNS for real-time data, Lambda for batch extraction
+2. Loading: Direct loading into S3 data lake with Apache Iceberg format
+3. Transformation: Amazon Athena for in-place transformations
+4. Query Engine: Amazon Athena for analytics
+5. Orchestration: Amazon MWAA (managed Airflow)
 
-## Step 1: Set Up GCP Environment
+## Step 1: Set Up AWS Environment
 
-First, we need to set up our Google Cloud Platform environment with all necessary services and permissions.
+First, we need to set up our Amazon Web Services environment with all necessary services and permissions.
 
-### Create a New GCP Project
+### Create AWS Resources
 
 ```bash
-# Install Google Cloud SDK if not already installed
-# https://cloud.google.com/sdk/docs/install
+# Install AWS CLI if not already installed
+# https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html
 
-# Initialize gcloud and create a new project
-gcloud init
-gcloud projects create climate-data-lake-iceberg --name="Climate Data Lake Iceberg"
+# Configure AWS CLI with your credentials
+aws configure
 
-# Set the newly created project as the current project
-gcloud config set project climate-data-lake-iceberg
+# Create an S3 bucket for raw data
+aws s3 mb s3://climate-lake-raw-data --region ap-southeast-2
+
+# Create an S3 bucket for Iceberg tables
+aws s3 mb s3://climate-lake-iceberg-tables --region ap-southeast-2
+
+# Create an AWS Glue Database for Iceberg catalog
+aws glue create-database --database-input '{"Name":"climate_catalog"}' --region ap-southeast-2
 ```
 
-### Enable Required APIs
+### Create IAM Roles and Policies
 
 ```bash
-# Enable necessary GCP services
-gcloud services enable storage-api.googleapis.com \
-                       bigquery.googleapis.com \
-                       pubsub.googleapis.com \
-                       cloudfunctions.googleapis.com \
-                       cloudscheduler.googleapis.com \
-                       composer.googleapis.com \
-                       dataflow.googleapis.com \
-                       artifactregistry.googleapis.com
-```
+# Create IAM role for data operations
+aws iam create-role --role-name data-lake-role \
+    --assume-role-policy-document '{
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": {
+                    "Service": [
+                        "lambda.amazonaws.com",
+                        "glue.amazonaws.com",
+                        "athena.amazonaws.com"
+                    ]
+                },
+                "Action": "sts:AssumeRole"
+            }
+        ]
+    }'
 
-### Create Service Accounts
+# Attach policies for S3 access
+aws iam attach-role-policy --role-name data-lake-role \
+    --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess
 
-```bash
-# Create service account for data operations
-gcloud iam service-accounts create data-lake-sa \
-    --description="Service account for data lake operations" \
-    --display-name="Data Lake Service Account"
+# Attach policies for Glue access
+aws iam attach-role-policy --role-name data-lake-role \
+    --policy-arn arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
 
-# Grant necessary permissions
-gcloud projects add-iam-policy-binding climate-data-lake-iceberg \
-    --member="serviceAccount:data-lake-sa@climate-data-lake-iceberg.iam.gserviceaccount.com" \
-    --role="roles/storage.admin"
-
-gcloud projects add-iam-policy-binding climate-data-lake-iceberg \
-    --member="serviceAccount:data-lake-sa@climate-data-lake-iceberg.iam.gserviceaccount.com" \
-    --role="roles/bigquery.admin"
-
-gcloud projects add-iam-policy-binding climate-data-lake-iceberg \
-    --member="serviceAccount:data-lake-sa@climate-data-lake-iceberg.iam.gserviceaccount.com" \
-    --role="roles/pubsub.editor"
+# Attach policies for Athena access
+aws iam attach-role-policy --role-name data-lake-role \
+    --policy-arn arn:aws:iam::aws:policy/AmazonAthenaFullAccess
 ```
 
 ### Initialize Local Development Environment
@@ -134,11 +138,8 @@ python -m venv iceberg-env
 source iceberg-env/bin/activate  # On Windows: iceberg-env\Scripts\activate
 
 # Install required packages
-pip install google-cloud-storage \
-            google-cloud-bigquery \
-            google-cloud-pubsub \
-            google-cloud-functions \
-            pyiceberg \
+pip install boto3 \
+            pyiceberg[s3,glue] \
             pandas \
             pyarrow \
             apache-airflow \
@@ -147,7 +148,7 @@ pip install google-cloud-storage \
 
 ## Step 2: Data Lake Storage Setup with Iceberg
 
-In this step, we'll set up our GCS buckets and configure Apache Iceberg to work with GCS as the storage backend.
+In this step, we'll set up our S3 buckets and configure Apache Iceberg to work with AWS Glue Data Catalog as the metadata store.
 
 ## Solution Architecture Diagram
 
@@ -161,76 +162,68 @@ flowchart TD
     end
 
     subgraph Ingestion["Data Ingestion"]
-        CF["Cloud Functions\n(Batch Processing)"] 
-        PS["Pub/Sub\n(Streaming Ingestion)"] 
-        SCF["Cloud Functions\n(Stream Processing)"] 
+        LAMBDA["AWS Lambda\n(Batch Processing)"] 
+        SNS["Amazon SNS\n(Streaming Ingestion)"] 
+        SLAMBDA["AWS Lambda\n(Stream Processing)"] 
     end
 
     subgraph Storage["Storage Layer"]
-        GCS["Google Cloud Storage"]
+        S3["Amazon S3"]
         ICEBERG["Apache Iceberg Tables"]
+        GLUE["AWS Glue Data Catalog"]
     end
 
     subgraph Transform["Transformation Layer"]
-        BQ["BigQuery"]
+        ATHENA["Amazon Athena"]
         VIEWS["SQL Views"]
         MAT["Materialized Tables"]
     end
 
     subgraph Orchestration
-        AIRFLOW["Cloud Composer\n(Airflow)"] 
+        MWAA["Amazon MWAA\n(Airflow)"] 
     end
 
     subgraph Analytics
-        LOOKER["Looker Studio\nDashboards"]
+        QS["Amazon QuickSight\nDashboards"]
     end
 
     %% Data flow connections
-    NOAA -->|Historical Data| CF
-    STREAM -->|Real-time Data| PS
-    PS --> SCF
-    CF -->|Load Raw Data| GCS
-    SCF -->|Load Events| GCS
-    GCS <-->|Register Tables| ICEBERG
-    ICEBERG <-->|External Tables| BQ
-    BQ -->|Create| VIEWS
-    BQ -->|Create| MAT
-    VIEWS --> LOOKER
-    MAT --> LOOKER
+    NOAA -->|Historical Data| LAMBDA
+    STREAM -->|Real-time Data| SNS
+    SNS --> SLAMBDA
+    LAMBDA -->|Load Raw Data| S3
+    SLAMBDA -->|Load Events| S3
+    S3 <-->|Store Data| ICEBERG
+    ICEBERG <-->|Metadata| GLUE
+    GLUE <-->|Table Registration| ATHENA
+    ATHENA -->|Create| VIEWS
+    ATHENA -->|Create| MAT
+    VIEWS --> QS
+    MAT --> QS
     
     %% Orchestration connections
-    AIRFLOW -->|Schedule & Monitor| CF
-    AIRFLOW -->|Trigger Transformations| BQ
-    AIRFLOW -->|Maintenance Tasks| ICEBERG
+    MWAA -->|Schedule & Monitor| LAMBDA
+    MWAA -->|Trigger Transformations| ATHENA
+    MWAA -->|Maintenance Tasks| ICEBERG
 
     %% Styling
-    classDef gcp fill:#4285F4,stroke:#326CE5,stroke-width:2px,color:white;
-    classDef data fill:#0F9D58,stroke:#0B8043,stroke-width:2px,color:white;
-    classDef process fill:#DB4437,stroke:#C23321,stroke-width:2px,color:white;
-    classDef analytics fill:#F4B400,stroke:#E09C07,stroke-width:2px,color:white;
+    classDef aws fill:#FF9900,stroke:#232F3E,stroke-width:2px,color:white;
+    classDef data fill:#01A88D,stroke:#025159,stroke-width:2px,color:white;
+    classDef process fill:#C925D1,stroke:#7D1C87,stroke-width:2px,color:white;
+    classDef analytics fill:#3B48CC,stroke:#152A74,stroke-width:2px,color:white;
     
     class NOAA,STREAM data;
-    class GCS,BQ,PS,CF,SCF,AIRFLOW gcp;
+    class S3,ATHENA,SNS,LAMBDA,SLAMBDA,MWAA,GLUE aws;
     class ICEBERG,VIEWS,MAT process;
-    class LOOKER analytics;
+    class QS analytics;
 ```
 
-### Create GCS Buckets
+### Create S3 Buckets
 
 ```bash
-# Create GCS buckets for the data lake zones
-gcloud storage buckets create gs://climate-lake-raw-data \
-    --location=us-central1 \
-    --uniform-bucket-level-access
-
-gcloud storage buckets create gs://climate-lake-iceberg-tables \
-    --location=us-central1 \
-    --uniform-bucket-level-access
-
-# Create a bucket for the Iceberg catalog
-gcloud storage buckets create gs://climate-lake-iceberg-catalog \
-    --location=us-central1 \
-    --uniform-bucket-level-access
+# Create S3 buckets for the data lake zones
+aws s3 mb s3://climate-lake-raw-data --region ap-southeast-2
+aws s3 mb s3://climate-lake-iceberg-tables --region ap-southeast-2
 ```
 
 ### Configure Apache Iceberg
@@ -242,23 +235,24 @@ We'll set up a Python script to configure the Iceberg catalog and create our ini
 
 from pyiceberg.catalog import load_catalog
 import os
+import boto3
 
-# Set environment variables
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "path/to/service-account-key.json"
+# Set environment variables, or use .env file to specify values of environment variables.
+os.environ["AWS_ACCESS_KEY_ID"] = "your-aws-access-key"
+os.environ["AWS_SECRET_ACCESS_KEY"] = "your-aws-secret-key"
+os.environ["AWS_REGION"] = "ap-southeast-2"
 
 # Create a catalog configuration
 catalog_config = {
-    "type": "rest",
-    "uri": "gs://climate-lake-iceberg-catalog",
-    "warehouse": "gs://climate-lake-iceberg-tables",
-    "credential": "gcp",
-    "region": "us-central1"
+    "type": "glue",
+    "warehouse": "s3://climate-lake-iceberg-tables",
+    "s3.region": "ap-southeast-2"
 }
 
 # Load the catalog
 iceberg_catalog = load_catalog("climate_catalog", **catalog_config)
 
-# Create a namespace
+# Create a namespace (equivalent to a database in Glue)
 iceberg_catalog.create_namespace("climate_data")
 ```
 
@@ -345,7 +339,7 @@ This will create our Iceberg catalog and tables with appropriate schemas. The ta
 
 ## Step 3: Data Extraction and Loading Pipelines
 
-In this step, we'll create two pipelines: one for batch extraction and loading of historical climate data, and another for simulating real-time data ingestion through Pub/Sub.
+In this step, we'll create two pipelines: one for batch extraction and loading of historical climate data, and another for simulating real-time data ingestion through Amazon SNS.
 
 ### Batch Extraction and Loading
 
@@ -360,29 +354,29 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from pyiceberg.catalog import load_catalog
-from google.cloud import storage
+import boto3
 import tempfile
 import datetime
 import time
 
 # Set environment variables for authentication
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "path/to/service-account-key.json"
+os.environ["AWS_ACCESS_KEY_ID"] = "your-aws-access-key"
+os.environ["AWS_SECRET_ACCESS_KEY"] = "your-aws-secret-key"
+os.environ["AWS_REGION"] = "ap-southeast-2"
 
 # Constants
 GHCN_STATIONS_URL = "https://www1.ncdc.noaa.gov/pub/data/ghcn/daily/ghcnd-stations.txt"
 GHCN_DATA_URL = "https://www1.ncdc.noaa.gov/pub/data/ghcn/daily/by_year/"
 RAW_BUCKET = "climate-lake-raw-data"
 
-# Initialize GCS client
-storage_client = storage.Client()
+# Initialize S3 client
+s3_client = boto3.client('s3')
 
 # Initialize Iceberg catalog
 catalog_config = {
-    "type": "rest",
-    "uri": "gs://climate-lake-iceberg-catalog",
-    "warehouse": "gs://climate-lake-iceberg-tables",
-    "credential": "gcp",
-    "region": "us-central1"
+    "type": "glue",
+    "warehouse": f"s3://{RAW_BUCKET}",
+    "s3.region": "ap-southeast-2"
 }
 
 iceberg_catalog = load_catalog("climate_catalog", **catalog_config)
@@ -391,16 +385,18 @@ iceberg_catalog = load_catalog("climate_catalog", **catalog_config)
 ```python
 # batch_loader.py - Part 2A (Helper functions)
 
-def download_and_upload_to_gcs(url, bucket_name, blob_name):
-    """Download data from URL and upload to GCS bucket"""
+def download_and_upload_to_s3(url, bucket_name, object_key):
+    """Download data from URL and upload to S3 bucket"""
     print(f"Downloading {url}...")
     response = requests.get(url)
     response.raise_for_status()
     
-    bucket = storage_client.bucket(bucket_name)
-    blob = bucket.blob(blob_name)
-    blob.upload_from_string(response.content)
-    print(f"Uploaded to gs://{bucket_name}/{blob_name}")
+    s3_client.put_object(
+        Bucket=bucket_name,
+        Key=object_key,
+        Body=response.content
+    )
+    print(f"Uploaded to s3://{bucket_name}/{object_key}")
     return response.content
 ```
 
@@ -412,7 +408,7 @@ def process_stations_data():
     print("Processing stations data...")
     
     # Download stations data
-    content = download_and_upload_to_gcs(
+    content = download_and_upload_to_s3(
         GHCN_STATIONS_URL, 
         RAW_BUCKET, 
         "ghcn/stations/ghcnd-stations.txt"
@@ -452,14 +448,16 @@ def process_stations_data():
         table = pa.Table.from_pandas(df)
         pq.write_table(table, tmp.name)
         
-        # Upload to GCS
+        # Upload to S3
         stations_blob_name = f"iceberg/stations/data/stations_{int(time.time())}.parquet"
-        bucket = storage_client.bucket(RAW_BUCKET)
-        blob = bucket.blob(stations_blob_name)
-        blob.upload_from_filename(tmp.name)
+        s3_client.upload_file(
+            tmp.name,
+            RAW_BUCKET,
+            stations_blob_name
+        )
     
     # Register data with Iceberg
-    stations_table.append(f"gs://{RAW_BUCKET}/{stations_blob_name}")
+    stations_table.append(f"s3://{RAW_BUCKET}/{stations_blob_name}")
     
     print(f"Loaded {len(df)} stations to Iceberg table")
     return df
@@ -477,7 +475,7 @@ def process_observations_data(year, stations_df=None):
     blob_name = f"ghcn/observations/by_year/{year}.csv.gz"
     
     try:
-        content = download_and_upload_to_gcs(url, RAW_BUCKET, blob_name)
+        content = download_and_upload_to_s3(url, RAW_BUCKET, blob_name)
         print(f"Downloaded data for year {year}")
     except requests.exceptions.HTTPError as e:
         print(f"Error downloading data for year {year}: {e}")
@@ -563,12 +561,14 @@ def process_observations_data(year, stations_df=None):
                     table = pa.Table.from_pandas(chunk_df)
                     pq.write_table(table, parquet_file)
                     
-                    # Upload to GCS
-                    parquet_blob_name = f"iceberg/observations/data/year={year}/chunk_{chunk_counter}_{int(time.time())}.parquet"
-                    bucket = storage_client.bucket(RAW_BUCKET)
-                    blob = bucket.blob(parquet_blob_name)
-                    blob.upload_from_filename(parquet_file)
-                    parquet_files.append(f"gs://{RAW_BUCKET}/{parquet_blob_name}")
+                    # Upload to S3
+                    parquet_object_key = f"iceberg/observations/data/year={year}/chunk_{chunk_counter}_{int(time.time())}.parquet"
+                    s3_client.upload_file(
+                        parquet_file,
+                        RAW_BUCKET,
+                        parquet_object_key
+                    )
+                    parquet_files.append(f"s3://{RAW_BUCKET}/{parquet_object_key}")
                     
                     # Reset for next chunk
                     chunk_data = []
@@ -606,42 +606,36 @@ if __name__ == "__main__":
     main()
 ```
 
-We can now run this script to extract data from NOAA, load it into our raw GCS buckets, and register it with our Iceberg tables:
+We can now run this script to extract data from NOAA, load it into our raw S3 buckets, and register it with our Iceberg tables:
 
 ```bash
 python batch_loader.py
 ```
 
-### Cloud Function for Batch Processing
+### AWS Lambda for Batch Processing
 
-To make this more production-ready, we can wrap this in a Cloud Function that can be triggered on a schedule. Let's create a basic Cloud Function that runs our batch loader:
+To make this more production-ready, we can wrap this in an AWS Lambda function that can be triggered on a schedule. Let's create a basic Lambda function that runs our batch loader:
 
 ```python
-# main.py (Cloud Function)
+# lambda_function.py (AWS Lambda)
 
-import functions_framework
-from batch_loader import process_stations_data, process_observations_data
+import json
 import datetime
+from batch_loader import process_stations_data, process_observations_data
 
-@functions_framework.http
-def climate_data_loader(request):
-    """HTTP Cloud Function that triggers the climate data loading process.
+def lambda_handler(event, context):
+    """AWS Lambda handler for climate data loading process.
     
     Args:
-        request (flask.Request): HTTP request object
+        event: Lambda event input
+        context: Lambda context
     Returns:
-        The response text or any set of values that can be turned into a
-        Response object using flask.make_response
+        Lambda response with processing information
     """
-    request_json = request.get_json(silent=True)
-    request_args = request.args
-    
     # Check if specific year was provided
     year = None
-    if request_json and 'year' in request_json:
-        year = int(request_json['year'])
-    elif request_args and 'year' in request_args:
-        year = int(request_args['year'])
+    if event and 'year' in event:
+        year = int(event['year'])
     else:
         # Default to previous year if not specified
         year = datetime.datetime.now().year - 1
@@ -652,80 +646,88 @@ def climate_data_loader(request):
     # Process observations for the specified year
     processed_records = process_observations_data(year, stations_df)
     
-    return f"Processed {processed_records} climate data records for year {year}."
+    return {
+        'statusCode': 200,
+        'body': json.dumps(f"Processed {processed_records} climate data records for year {year}.")
+    }
 ```
 
-We also need to create a requirements.txt file for the Cloud Function:
+For the Lambda function, we need a `requirements.txt` file:
 
 ```
 # requirements.txt
 
-functions-framework==3.3.0
-google-cloud-storage==2.8.0
-pyiceberg==0.16.1
+boto3==1.28.38
+pyiceberg[s3,glue]==0.16.1
 pandas==2.0.1
 pyarrow==12.0.0
 requests==2.31.0
 ```
 
-We can deploy this Cloud Function using the gcloud command:
+We can deploy this Lambda function using the AWS CLI:
 
 ```bash
-gcloud functions deploy climate-data-loader \
-  --gen2 \
-  --runtime=python310 \
-  --region=us-central1 \
-  --source=. \
-  --entry-point=climate_data_loader \
-  --trigger-http \
-  --service-account=data-lake-sa@climate-data-lake-iceberg.iam.gserviceaccount.com \
-  --timeout=540s \
-  --memory=2048MB
+# Create a deployment package
+pip install -r requirements.txt -t ./package
+cd package
+zip -r ../lambda_deployment.zip .
+cd ..
+zip -g lambda_deployment.zip lambda_function.py batch_loader.py
+
+# Deploy the Lambda function
+aws lambda create-function \
+  --function-name climate-data-loader \
+  --runtime python3.9 \
+  --role arn:aws:iam::<account-id>:role/data-lake-role \
+  --handler lambda_function.lambda_handler \
+  --timeout 900 \
+  --memory-size 2048 \
+  --zip-file fileb://lambda_deployment.zip
 ```
 
-### Cloud Scheduler for Automated Execution
+### Amazon EventBridge for Automated Execution
 
-Let's set up a Cloud Scheduler to trigger our function automatically. This will pull data daily from the NOAA API:
+Let's set up an EventBridge rule to trigger our Lambda function automatically. This will pull data daily from the NOAA API:
 
 ```bash
-# Create a service account for the scheduler
-gcloud iam service-accounts create scheduler-sa \
-    --description="Service account for Cloud Scheduler" \
-    --display-name="Cloud Scheduler Service Account"
+# Create an EventBridge rule
+aws events put-rule \
+  --name climate-data-daily-job \
+  --schedule-expression "cron(0 2 * * ? *)" \
+  --state ENABLED
 
-# Grant necessary permissions
-gcloud projects add-iam-policy-binding climate-data-lake-iceberg \
-    --member="serviceAccount:scheduler-sa@climate-data-lake-iceberg.iam.gserviceaccount.com" \
-    --role="roles/cloudfunctions.invoker"
+# Add permission for EventBridge to invoke Lambda
+aws lambda add-permission \
+  --function-name climate-data-loader \
+  --statement-id climate-data-scheduled-event \
+  --action 'lambda:InvokeFunction' \
+  --principal events.amazonaws.com \
+  --source-arn arn:aws:events:<region>:<account-id>:rule/climate-data-daily-job
 
-# Create scheduler job for daily runs
-gcloud scheduler jobs create http climate-data-daily-job \
-    --schedule="0 2 * * *" \
-    --uri="https://us-central1-climate-data-lake-iceberg.cloudfunctions.net/climate-data-loader" \
-    --http-method=GET \
-    --oidc-service-account-email="scheduler-sa@climate-data-lake-iceberg.iam.gserviceaccount.com" \
-    --oidc-token-audience="https://us-central1-climate-data-lake-iceberg.cloudfunctions.net/climate-data-loader"
+# Set the Lambda function as the target for the rule
+aws events put-targets \
+  --rule climate-data-daily-job \
+  --targets '[{"Id": "1", "Arn": "arn:aws:lambda:<region>:<account-id>:function:climate-data-loader"}]'
 ```
 
 This scheduler will run our data load function every day at 2:00 AM UTC.
 
-### Streaming Pipeline with Pub/Sub
+### Streaming Pipeline with Amazon SNS
 
-Let's create a streaming pipeline to simulate real-time climate data ingestion. First, we'll set up a Pub/Sub topic:
+Let's create a streaming pipeline to simulate real-time climate data ingestion. First, we'll set up an Amazon SNS topic:
 
 ```bash
-# Create a Pub/Sub topic for climate data
-gcloud pubsub topics create climate-data-stream
+# Create an SNS topic for climate data
+aws sns create-topic --name climate-data-stream
 ```
 
-Now, let's create a Cloud Function that will be triggered when a message is published to this topic:
+Now, let's create a Lambda function that will be triggered when a message is published to this topic:
 
 ```python
 # stream_processor.py - Part 1 (Imports and Setup)
 
-import base64
 import json
-import functions_framework
+import base64
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -733,48 +735,52 @@ import tempfile
 import time
 import os
 from datetime import datetime
-from google.cloud import storage
+import boto3
 from pyiceberg.catalog import load_catalog
 
 # Set environment variables for authentication
-os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "path/to/service-account-key.json"
+os.environ["AWS_REGION"] = "ap-southeast-2"
 
 # Constants
 RAW_BUCKET = "climate-lake-raw-data"
 
-# Initialize GCS client
-storage_client = storage.Client()
+# Initialize S3 client
+s3_client = boto3.client('s3')
 
 # Initialize Iceberg catalog
 catalog_config = {
-    "type": "rest",
-    "uri": "gs://climate-lake-iceberg-catalog",
-    "warehouse": "gs://climate-lake-iceberg-tables",
-    "credential": "gcp",
-    "region": "us-central1"
+    "type": "glue",
+    "warehouse": f"s3://{RAW_BUCKET}",
+    "s3.region": "ap-southeast-2"
 }
 
 iceberg_catalog = load_catalog("climate_catalog", **catalog_config)
 ```
 
 ```python
-# stream_processor.py - Part 2 (Function Implementation)
+# stream_processor.py - Part 2 (Lambda Function Implementation)
 
-@functions_framework.cloud_event
-def process_pubsub_message(cloud_event):
-    """When a message is published to Pub/Sub, this function is triggered.
+def lambda_handler(event, context):
+    """When a message is published to SNS, this function is triggered.
     The function processes the climate data and saves it to Iceberg.
     
     Args:
-        cloud_event: The CloudEvent that triggered this function
+        event: Lambda event containing the SNS message
+        context: Lambda context
     """
-    # Get the message data
-    pubsub_message = base64.b64decode(cloud_event.data["message"]["data"]).decode("utf-8")
-    print(f"Received message: {pubsub_message}")
-    
+    # Get the SNS message
     try:
+        # For SNS, the message is in Records[0].Sns.Message
+        if 'Records' in event and event['Records'][0]['EventSource'] == 'aws:sns':
+            message_text = event['Records'][0]['Sns']['Message']
+        else:
+            # For direct Lambda invocation
+            message_text = json.dumps(event)
+        
+        print(f"Received message: {message_text}")
+        
         # Parse the message as JSON
-        message_data = json.loads(pubsub_message)
+        message_data = json.loads(message_text)
         
         # Create a DataFrame from the message
         df = pd.DataFrame([message_data])
@@ -802,7 +808,7 @@ def process_pubsub_message(cloud_event):
             table = pa.Table.from_pandas(df)
             pq.write_table(table, tmp.name)
             
-            # Generate blob name with correct partitioning
+            # Generate S3 key with correct partitioning
             # Extract year and month for partitioning
             if isinstance(df['date'].iloc[0], str):
                 date_obj = datetime.strptime(df['date'].iloc[0], '%Y-%m-%d')
@@ -812,41 +818,69 @@ def process_pubsub_message(cloud_event):
             year = date_obj.year
             month = date_obj.month
             
-            # Create blob name with partitioning
-            parquet_blob_name = f"iceberg/observations/data/year={year}/month={month}/stream_{int(time.time())}.parquet"
+            # Create S3 key with partitioning
+            parquet_key = f"iceberg/observations/data/year={year}/month={month}/stream_{int(time.time())}.parquet"
             
-            # Upload to GCS
-            bucket = storage_client.bucket(RAW_BUCKET)
-            blob = bucket.blob(parquet_blob_name)
-            blob.upload_from_filename(tmp.name)
+            # Upload to S3
+            s3_client.upload_file(
+                tmp.name, 
+                RAW_BUCKET, 
+                parquet_key
+            )
             
             # Register with Iceberg
-            observations_table.append(f"gs://{RAW_BUCKET}/{parquet_blob_name}")
+            observations_table.append(f"s3://{RAW_BUCKET}/{parquet_key}")
             
             print(f"Successfully processed streaming record and wrote to Iceberg table")
-            return "Success", 200
+            return {
+                'statusCode': 200,
+                'body': json.dumps('Success')
+            }
     
     except Exception as e:
         print(f"Error processing message: {str(e)}")
-        return f"Error: {str(e)}", 500
+        return {
+            'statusCode': 500,
+            'body': json.dumps(f"Error: {str(e)}")
+        }
 ```
 
-Now we can deploy this Cloud Function with the following command:
+Now we can deploy this Lambda function with the following command:
 
 ```bash
-gcloud functions deploy climate-data-stream-processor \
-  --gen2 \
-  --runtime=python310 \
-  --region=us-central1 \
-  --source=. \
-  --entry-point=process_pubsub_message \
-  --trigger-topic=climate-data-stream \
-  --service-account=data-lake-sa@climate-data-lake-iceberg.iam.gserviceaccount.com \
-  --timeout=60s \
-  --memory=512MB
+# Create a deployment package
+pip install -r requirements.txt -t ./stream_package
+cd stream_package
+zip -r ../stream_lambda.zip .
+cd ..
+zip -g stream_lambda.zip stream_processor.py
+
+# Deploy the Lambda function
+aws lambda create-function \
+  --function-name climate-data-stream-processor \
+  --runtime python3.9 \
+  --role arn:aws:iam::<account-id>:role/data-lake-role \
+  --handler stream_processor.lambda_handler \
+  --timeout 60 \
+  --memory-size 512 \
+  --zip-file fileb://stream_lambda.zip
+
+# Configure SNS to trigger the Lambda function
+aws lambda add-permission \
+  --function-name climate-data-stream-processor \
+  --statement-id sns-climate-data \
+  --action 'lambda:InvokeFunction' \
+  --principal sns.amazonaws.com \
+  --source-arn arn:aws:sns:<region>:<account-id>:climate-data-stream
+
+# Subscribe the Lambda function to the SNS topic
+aws sns subscribe \
+  --topic-arn arn:aws:sns:<region>:<account-id>:climate-data-stream \
+  --protocol lambda \
+  --notification-endpoint arn:aws:lambda:<region>:<account-id>:function:climate-data-stream-processor
 ```
 
-To test our streaming pipeline, we can publish a test message to the Pub/Sub topic:
+To test our streaming pipeline, we can publish a test message to the SNS topic:
 
 ```bash
 # Create a test message file
@@ -863,59 +897,36 @@ cat > test_message.json << EOL
 }
 EOL
 
-# Publish the message to Pub/Sub
-gcloud pubsub topics publish climate-data-stream --message="$(cat test_message.json)"
+# Publish the message to SNS
+aws sns publish \
+  --topic-arn arn:aws:sns:<region>:<account-id>:climate-data-stream \
+  --message file://test_message.json
 ```
 
-## Step 4: Transformation in BigQuery
+## Step 4: Transformation in Amazon Athena
 
-Now that we have our data loading pipelines set up, let's implement the transformation layer in BigQuery. This is where the ELT approach differs from ETL - we'll transform the data after it's loaded.
+Now that we have our data loading pipelines set up, let's implement the transformation layer in Amazon Athena. This is where the ELT approach differs from ETL - we'll transform the data after it's loaded.
 
-### Connect BigQuery to Iceberg Tables
+### Connect Amazon Athena to Iceberg Tables
 
-First, we need to create BigQuery external tables that connect to our Iceberg data:
+Since we're using AWS Glue Data Catalog, Iceberg tables are automatically available in Athena. Let's create some transformations and views on top of these tables to make the data more usable for analytics.
+
+First, let's create a workgroup for our Athena queries:
 
 ```bash
-# Create a BigQuery dataset for our climate data
-bq mk --dataset climate_data_lake
-
-# Create external connection to our Iceberg tables
-bq mk --connection --location=us-central1 \
-    --connection_type=CLOUD_RESOURCE \
-    iceberg_connection
-
-# Grant necessary permissions to the connection service account
-CONNECTION_SA=$(bq show --format=json --connection climate_data_lake.iceberg_connection | jq -r '.cloudResource.serviceAccountId')
-
-gcloud projects add-iam-policy-binding climate-data-lake-iceberg \
-    --member="serviceAccount:${CONNECTION_SA}" \
-    --role="roles/storage.objectViewer"
-
-# Create external tables for Iceberg data
-bq query --nouse_legacy_sql \
-'CREATE EXTERNAL TABLE climate_data_lake.stations \
-OPTIONS (
-  format = "ICEBERG",
-  uris = ["gs://climate-lake-iceberg-tables/climate_data/stations"],
-  connection = "climate_data_lake.iceberg_connection"
-)'
-
-bq query --nouse_legacy_sql \
-'CREATE EXTERNAL TABLE climate_data_lake.observations \
-OPTIONS (
-  format = "ICEBERG",
-  uris = ["gs://climate-lake-iceberg-tables/climate_data/observations"],
-  connection = "climate_data_lake.iceberg_connection"
-)'
+# Create an Athena workgroup
+aws athena create-work-group \
+  --name climate-data-workgroup \
+  --configuration 'ResultConfiguration={OutputLocation=s3://climate-lake-raw-data/athena-results/}'
 ```
 
-Now, we can create transformations and views on top of these tables to make the data more usable for analytics:
+### Create Transformation Views in Athena
 
-### Create Transformation Views
+Now, let's create SQL views to transform our data for analysis:
 
 ```sql
 -- Create a view that pivots temperature and precipitation data for easier analysis
-CREATE OR REPLACE VIEW climate_data_lake.daily_weather_summary AS
+CREATE OR REPLACE VIEW daily_weather_summary AS
 WITH temperature_data AS (
   SELECT
     station_id,
@@ -927,7 +938,7 @@ WITH temperature_data AS (
     MAX(CASE WHEN element = 'SNOW' THEN value END) AS snowfall_mm,
     MAX(CASE WHEN element = 'SNWD' THEN value END) AS snow_depth_mm
   FROM
-    climate_data_lake.observations
+    climate_catalog.climate_data.observations
   WHERE
     element IN ('TMAX', 'TMIN', 'TAVG', 'PRCP', 'SNOW', 'SNWD')
   GROUP BY
@@ -944,7 +955,7 @@ SELECT
 FROM
   temperature_data t
 JOIN
-  climate_data_lake.stations s
+  climate_catalog.climate_data.stations s
 ON
   t.station_id = s.station_id;
 ```
@@ -953,7 +964,7 @@ Now, let's create a more specialized view for monthly climate summaries:
 
 ```sql
 -- Create a monthly climate summary view
-CREATE OR REPLACE VIEW climate_data_lake.monthly_climate_summary AS
+CREATE OR REPLACE VIEW monthly_climate_summary AS
 SELECT
   station_id,
   station_name,
@@ -971,7 +982,7 @@ SELECT
   SUM(precipitation_mm) AS total_precipitation,
   COUNT(date) AS days_in_month
 FROM
-  climate_data_lake.daily_weather_summary
+  daily_weather_summary
 WHERE
   max_temp_celsius IS NOT NULL OR
   min_temp_celsius IS NOT NULL OR
@@ -982,14 +993,16 @@ ORDER BY
   station_id, year, month;
 ```
 
-Let's also create a materialized table for faster query performance on the most commonly accessed data:
+Let's also create a materialized table for faster query performance on the most commonly accessed data using the CTAS (Create Table As Select) feature in Athena:
 
 ```sql
 -- Create a materialized table for commonly accessed data
-CREATE OR REPLACE TABLE climate_data_lake.annual_climate_summary
-PARTITION BY year
-CLUSTER BY country, state
-AS
+CREATE TABLE annual_climate_summary
+WITH (
+  format = 'PARQUET',
+  partitioned_by = ARRAY['year'],
+  external_location = 's3://climate-lake-iceberg-tables/materialized/annual_climate/'
+) AS
 SELECT
   station_id,
   station_name,
@@ -1006,74 +1019,172 @@ SELECT
   SUM(total_precipitation) AS yearly_total_precipitation,
   SUM(days_in_month) AS days_with_data
 FROM
-  climate_data_lake.monthly_climate_summary
+  monthly_climate_summary
 GROUP BY
   station_id, station_name, country, state, latitude, longitude, year
 ORDER BY
   country, state, station_id, year;
 ```
 
-### Create Scheduled Refresh Query
+### Create Scheduled Query in Athena
 
-Now we'll set up a scheduled query to refresh our materialized table daily:
+We can use EventBridge and Lambda to schedule the refresh of our materialized table. First, let's create a Lambda function to run the Athena query:
+
+```python
+# athena_refresh.py
+
+import boto3
+import time
+import os
+
+def lambda_handler(event, context):
+    # Initialize Athena client
+    athena = boto3.client('athena')
+    
+    # Define our query
+    query = """
+    INSERT INTO annual_climate_summary
+    SELECT
+      station_id,
+      station_name,
+      country,
+      state,
+      latitude,
+      longitude,
+      year,
+      AVG(avg_max_temp) AS yearly_avg_max_temp,
+      AVG(avg_min_temp) AS yearly_avg_min_temp,
+      AVG(avg_temp) AS yearly_avg_temp,
+      MAX(highest_max_temp) AS yearly_highest_max_temp,
+      MIN(lowest_min_temp) AS yearly_lowest_min_temp,
+      SUM(total_precipitation) AS yearly_total_precipitation,
+      SUM(days_in_month) AS days_with_data
+    FROM
+      monthly_climate_summary
+    WHERE
+      year = EXTRACT(YEAR FROM CURRENT_DATE) - 1
+    GROUP BY
+      station_id, station_name, country, state, latitude, longitude, year
+    """
+    
+    # Execute the query
+    response = athena.start_query_execution(
+        QueryString=query,
+        QueryExecutionContext={
+            'Database': 'climate_catalog'
+        },
+        ResultConfiguration={
+            'OutputLocation': 's3://climate-lake-raw-data/athena-results/'
+        },
+        WorkGroup='climate-data-workgroup'
+    )
+    
+    # Get query execution ID
+    query_execution_id = response['QueryExecutionId']
+    print(f"Started query: {query_execution_id}")
+    
+    # Wait for query to complete
+    state = 'RUNNING'
+    while state == 'RUNNING' or state == 'QUEUED':
+        response = athena.get_query_execution(QueryExecutionId=query_execution_id)
+        state = response['QueryExecution']['Status']['State']
+        if state == 'RUNNING' or state == 'QUEUED':
+            time.sleep(1)
+    
+    # Check if query was successful
+    if state == 'SUCCEEDED':
+        print(f"Query {query_execution_id} completed successfully.")
+        return {
+            'statusCode': 200,
+            'body': f"Query {query_execution_id} completed successfully."
+        }
+    else:
+        error_message = response['QueryExecution']['Status']['StateChangeReason']
+        print(f"Query {query_execution_id} failed: {error_message}")
+        return {
+            'statusCode': 500,
+            'body': f"Query failed: {error_message}"
+        }
+```
+
+Now let's schedule this Lambda function to run daily:
 
 ```bash
-# Create a scheduled query to refresh the materialized table daily
-bq query --nouse_legacy_sql \
-'CREATE OR REPLACE MATERIALIZED VIEW climate_data_lake.annual_climate_summary_refresh
-PARTITION BY year
-CLUSTER BY country, state
-AS
-SELECT
-  station_id,
-  station_name,
-  country,
-  state,
-  latitude,
-  longitude,
-  year,
-  AVG(avg_max_temp) AS yearly_avg_max_temp,
-  AVG(avg_min_temp) AS yearly_avg_min_temp,
-  AVG(avg_temp) AS yearly_avg_temp,
-  MAX(highest_max_temp) AS yearly_highest_max_temp,
-  MIN(lowest_min_temp) AS yearly_lowest_min_temp,
-  SUM(total_precipitation) AS yearly_total_precipitation,
-  SUM(days_in_month) AS days_with_data
-FROM
-  climate_data_lake.monthly_climate_summary
-GROUP BY
-  station_id, station_name, country, state, latitude, longitude, year
-ORDER BY
-  country, state, station_id, year;'
+# Create the Lambda function for Athena query
+aws lambda create-function \
+  --function-name refresh-climate-materialized-view \
+  --runtime python3.9 \
+  --role arn:aws:iam::<account-id>:role/data-lake-role \
+  --handler athena_refresh.lambda_handler \
+  --timeout 300 \
+  --memory-size 128 \
+  --zip-file fileb://athena_refresh.zip
 
-# Set up a scheduled query to refresh daily at 3:00 AM
-bq query --nouse_legacy_sql --destination_table=climate_data_lake.annual_climate_summary \
---schedule="every 24 hours" --replace=true \
-'SELECT * FROM climate_data_lake.annual_climate_summary_refresh'
+# Create an EventBridge rule to run daily at 3:00 AM UTC
+aws events put-rule \
+  --name daily-climate-data-refresh \
+  --schedule-expression "cron(0 3 * * ? *)" \
+  --state ENABLED
+
+# Set the Lambda function as the target for the rule
+aws events put-targets \
+  --rule daily-climate-data-refresh \
+  --targets '[{"Id": "1", "Arn": "arn:aws:lambda:<region>:<account-id>:function:refresh-climate-materialized-view"}]'
+
+# Add permission for EventBridge to invoke Lambda
+aws lambda add-permission \
+  --function-name refresh-climate-materialized-view \
+  --statement-id climate-data-scheduled-refresh \
+  --action 'lambda:InvokeFunction' \
+  --principal events.amazonaws.com \
+  --source-arn arn:aws:events:<region>:<account-id>:rule/daily-climate-data-refresh
 ```
 
 With these transformations, we've created a robust data pipeline that follows the ELT pattern:
 
 1. Extract: Data is pulled from NOAA sources via batch and streaming methods
-2. Load: Raw data is loaded directly into GCS and registered with Apache Iceberg
-3. Transform: Data is transformed in BigQuery using SQL views and materialized tables
+2. Load: Raw data is loaded directly into S3 and registered with Apache Iceberg
+3. Transform: Data is transformed in Amazon Athena using SQL views and materialized tables
 
-## Step 5: Orchestration with Cloud Composer
+## Step 5: Orchestration with Amazon MWAA
 
-To orchestrate our entire data pipeline, we'll use Cloud Composer (GCP's managed Apache Airflow service). This will help us coordinate the batch data extraction, loading, and transformation processes.
+To orchestrate our entire data pipeline, we'll use Amazon Managed Workflows for Apache Airflow (MWAA). This will help us coordinate the batch data extraction, loading, and transformation processes.
 
-### Create Cloud Composer Environment
+### Create Amazon MWAA Environment
+
+First, we need to set up an Amazon S3 bucket for MWAA and upload our DAG files:
 
 ```bash
-# Create a Cloud Composer environment
-gcloud composer environments create climate-data-orchestrator \
-  --location us-central1 \
-  --image-version composer-2.6.0-airflow-2.6.3 \
-  --node-count 3 \
-  --zone us-central1-a \
-  --machine-type n1-standard-2 \
-  --service-account data-lake-sa@climate-data-lake-iceberg.iam.gserviceaccount.com \
-  --python-version 3.8
+# Create an S3 bucket for MWAA
+aws s3 mb s3://climate-data-mwaa --region ap-southeast-2
+
+# Create directories for MWAA
+mkdir -p mwaa/dags mwaa/plugins mwaa/requirements
+
+# Create a requirements.txt file for MWAA
+cat > mwaa/requirements/requirements.txt << EOL
+apache-airflow-providers-amazon>=2.0.0
+pyiceberg[s3,glue]<=0.9.1
+EOL
+
+# Upload files to S3
+aws s3 cp mwaa/requirements/requirements.txt s3://climate-data-mwaa/requirements.txt
+```
+
+Now, let's create an MWAA environment:
+
+```bash
+# Create MWAA environment
+aws mwaa create-environment \
+  --name climate-data-orchestrator \
+  --source-bucket-arn arn:aws:s3:::climate-data-mwaa \
+  --dag-s3-path dags \
+  --network-configuration '{"SubnetIds": ["subnet-xxxx", "subnet-yyyy"],"SecurityGroupIds": ["sg-zzzz"]}' \
+  --execution-role-arn arn:aws:iam::<account-id>:role/mwaa-execution-role \
+  --airflow-version 2.4.3 \
+  --environment-class mw1.small \
+  --max-workers 2 \
+  --requirements-s3-path requirements.txt
 ```
 
 Now, let's create our DAG file to orchestrate the data pipeline:
@@ -1083,13 +1194,11 @@ Now, let's create our DAG file to orchestrate the data pipeline:
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.operators.bash import BashOperator
-from airflow.providers.google.cloud.operators.bigquery import BigQueryExecuteQueryOperator
-from airflow.providers.google.cloud.operators.functions import CloudFunctionInvokeOperator
+from airflow.providers.amazon.aws.operators.lambda_function import AwsLambdaInvokeOperator
+from airflow.providers.amazon.aws.operators.athena import AthenaOperator
 from datetime import datetime, timedelta
-import requests
-import os
 import json
+import boto3
 
 # Define default arguments
 default_args = {
@@ -1113,85 +1222,124 @@ with DAG(
 ) as dag:
 
     # Task 1: Load Stations Data
-    load_stations = CloudFunctionInvokeOperator(
+    load_stations = AwsLambdaInvokeOperator(
         task_id='load_stations_data',
-        function_id='climate-data-loader',
-        location='us-central1',
-        project_id='climate-data-lake-iceberg',
-        data=json.dumps({'load_stations_only': True}),
+        function_name='climate-data-loader',
+        payload=json.dumps({'load_stations_only': True}),
     )
 
     # Task 2: Load Observations Data (for yesterday)
     yesterday = '{{ macros.ds_add(ds, -1) }}'
-    load_observations = CloudFunctionInvokeOperator(
+    load_observations = AwsLambdaInvokeOperator(
         task_id='load_observations_data',
-        function_id='climate-data-loader',
-        location='us-central1',
-        project_id='climate-data-lake-iceberg',
-        data=json.dumps({'year': '{{ execution_date.year }}', 'month': '{{ execution_date.month }}', 'day': '{{ execution_date.day }}'}),
+        function_name='climate-data-loader',
+        payload=json.dumps({'year': '{{ execution_date.year }}', 'month': '{{ execution_date.month }}', 'day': '{{ execution_date.day }}'}),
     )
 ```
 
 ```python
     # Task 3: Run Data Quality Check on Iceberg Tables
-    run_dq_check = BashOperator(
+    check_tables_query = """
+    SELECT 
+        'stations' as table_name, COUNT(*) as row_count 
+    FROM 
+        climate_catalog.climate_data.stations
+    UNION ALL
+    SELECT 
+        'observations' as table_name, COUNT(*) as row_count 
+    FROM 
+        climate_catalog.climate_data.observations
+    WHERE 
+        date = DATE '{{ execution_date.strftime("%Y-%m-%d") }}'
+    """
+    
+    run_dq_check = AthenaOperator(
         task_id='run_data_quality_check',
-        bash_command="""python -c 'from pyiceberg.catalog import load_catalog; 
-        import os; 
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/opt/airflow/dags/keys/service-account-key.json"; 
-        catalog_config = {"type": "rest", "uri": "gs://climate-lake-iceberg-catalog", "warehouse": "gs://climate-lake-iceberg-tables", "credential": "gcp", "region": "us-central1"}; 
-        iceberg_catalog = load_catalog("climate_catalog", **catalog_config); 
-        stations_table = iceberg_catalog.load_table("climate_data.stations"); 
-        observations_table = iceberg_catalog.load_table("climate_data.observations"); 
-        print(f"Stations count: {stations_table.scan().to_arrow().num_rows}"); 
-        print(f"Observations count: {observations_table.scan().to_arrow().num_rows}"); 
-        '""",
+        query=check_tables_query,
+        database='climate_catalog',
+        output_location='s3://climate-lake-raw-data/athena-results/',
+        aws_conn_id='aws_default',
     )
 ```
 
 ```python
-    # Task 4: Refresh BigQuery Materialized View
-    refresh_bigquery_view = BigQueryExecuteQueryOperator(
-        task_id='refresh_bigquery_view',
-        sql='SELECT * FROM climate_data_lake.annual_climate_summary_refresh',
-        destination_dataset_table='climate-data-lake-iceberg:climate_data_lake.annual_climate_summary',
-        write_disposition='WRITE_TRUNCATE',
-        create_disposition='CREATE_IF_NEEDED',
-        use_legacy_sql=False,
-        location='us-central1',
+    # Task 4: Refresh Materialized View
+    refresh_view_query = """
+    INSERT INTO climate_catalog.climate_data.annual_climate_summary
+    SELECT
+      station_id,
+      station_name,
+      country,
+      state,
+      latitude,
+      longitude,
+      year,
+      AVG(avg_max_temp) AS yearly_avg_max_temp,
+      AVG(avg_min_temp) AS yearly_avg_min_temp,
+      AVG(avg_temp) AS yearly_avg_temp,
+      MAX(highest_max_temp) AS yearly_highest_max_temp,
+      MIN(lowest_min_temp) AS yearly_lowest_min_temp,
+      SUM(total_precipitation) AS yearly_total_precipitation,
+      SUM(days_in_month) AS days_with_data
+    FROM
+      climate_catalog.climate_data.monthly_climate_summary
+    WHERE
+      year = EXTRACT(YEAR FROM CURRENT_DATE) - 1
+    GROUP BY
+      station_id, station_name, country, state, latitude, longitude, year
+    """
+    
+    refresh_materialized_view = AthenaOperator(
+        task_id='refresh_materialized_view',
+        query=refresh_view_query,
+        database='climate_catalog',
+        output_location='s3://climate-lake-raw-data/athena-results/',
+        aws_conn_id='aws_default',
     )
 ```
 
 ```python
     # Task 5: Perform Iceberg Maintenance (compaction)
-    run_iceberg_maintenance = BashOperator(
+    def run_iceberg_maintenance():
+        from pyiceberg.catalog import load_catalog
+        import os
+        
+        catalog_config = {
+            "type": "glue",
+            "warehouse": "s3://climate-lake-iceberg-tables",
+            "s3.region": "ap-southeast-2"
+        }
+        
+        iceberg_catalog = load_catalog("climate_catalog", **catalog_config)
+        
+        stations_table = iceberg_catalog.load_table("climate_data.stations")
+        observations_table = iceberg_catalog.load_table("climate_data.observations")
+        
+        # Compact small files
+        stations_table.rewrite_data_files()
+        observations_table.rewrite_data_files()
+        
+        return "Maintenance completed successfully"
+    
+    run_maintenance = PythonOperator(
         task_id='run_iceberg_maintenance',
-        bash_command="""python -c 'from pyiceberg.catalog import load_catalog; 
-        import os; 
-        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = "/opt/airflow/dags/keys/service-account-key.json"; 
-        catalog_config = {"type": "rest", "uri": "gs://climate-lake-iceberg-catalog", "warehouse": "gs://climate-lake-iceberg-tables", "credential": "gcp", "region": "us-central1"}; 
-        iceberg_catalog = load_catalog("climate_catalog", **catalog_config); 
-        stations_table = iceberg_catalog.load_table("climate_data.stations"); 
-        observations_table = iceberg_catalog.load_table("climate_data.observations"); 
-        stations_table.rewrite_data_files(); 
-        observations_table.rewrite_data_files(); 
-        '""",
+        python_callable=run_iceberg_maintenance,
     )
     
     # Define task dependencies
-    load_stations >> load_observations >> run_dq_check >> refresh_bigquery_view >> run_iceberg_maintenance
+    load_stations >> load_observations >> run_dq_check >> refresh_materialized_view >> run_maintenance
 ```
 
-Upload the DAG to Cloud Composer:
+Upload the DAG to Amazon MWAA:
 
 ```bash
-# Get the DAGs folder for the Cloud Composer environment
-DAGS_FOLDER=$(gcloud composer environments describe climate-data-orchestrator \
-  --location us-central1 \
-  --format="get(config.dagGcsPrefix)")
+# Save the DAG file
+cat > mwaa/dags/climate_data_dag.py << EOL
+# Paste DAG code here
+EOL
 
-# Upload the DAG
-gcloud storage cp climate_data_dag.py ${DAGS_FOLDER}/
+# Upload the DAG to S3
+aws s3 cp mwaa/dags/climate_data_dag.py s3://climate-data-mwaa/dags/
 ```
 
 This Airflow DAG orchestrates our entire pipeline:
@@ -1199,22 +1347,25 @@ This Airflow DAG orchestrates our entire pipeline:
 1. Load stations metadata from NOAA
 2. Load observations data for the current execution date
 3. Run data quality checks on the Iceberg tables
-4. Refresh the BigQuery materialized views for analytics
+4. Refresh the materialized views for analytics
 5. Perform Iceberg table maintenance for optimal performance
 
 ## Step 6: Analytics and Visualization
 
-Now that we have our data pipeline set up, we can create visualizations and analytics dashboards using Looker Studio (formerly Data Studio) connected to our BigQuery views.
+Now that we have our data pipeline set up, we can create visualizations and analytics dashboards using Amazon QuickSight connected to our Athena views.
 
-### Connect Looker Studio to BigQuery
+### Connect Amazon QuickSight to Athena
 
-Follow these steps to create a dashboard in Looker Studio:
+Follow these steps to create a dashboard in Amazon QuickSight:
 
-1. Go to Looker Studio: https://lookerstudio.google.com/
-2. Click "Create" and select "Report"
-3. Select "BigQuery" as the data source
-4. Navigate to your project and select the climate_data_lake.monthly_climate_summary view
-5. Click "Add to Report"
+1. Go to the Amazon QuickSight console and sign in
+2. Select "New analysis"
+3. Select "New dataset"
+4. Choose "Athena" as the data source
+5. Configure the Athena connection (if not already set up)
+6. Select the `climate_catalog` database and the `monthly_climate_summary` view
+7. Choose "Import to SPICE for quicker analytics" for better performance
+8. Click "Visualize"
 
 ### Example Visualizations
 
@@ -1226,7 +1377,7 @@ Here are some example visualizations you can create using the climate data:
 - Gauge: Show current temperature compared to historical averages
 - Scatter Plot: Analyze the relationship between temperature and precipitation
 
-Example SQL query for creating a custom visualization in BigQuery:
+Example Athena query for creating a custom visualization in QuickSight:
 
 ```sql
 -- Query for temperature anomaly visualization
@@ -1236,7 +1387,7 @@ WITH station_baselines AS (
     month,
     AVG(avg_temp) AS baseline_temp
   FROM
-    climate_data_lake.monthly_climate_summary
+    climate_catalog.climate_data.monthly_climate_summary
   WHERE
     year BETWEEN 1980 AND 2010  -- Standard baseline period
   GROUP BY
@@ -1256,7 +1407,7 @@ SELECT
   b.baseline_temp,
   c.avg_temp - b.baseline_temp AS temp_anomaly
 FROM
-  climate_data_lake.monthly_climate_summary c
+  climate_catalog.climate_data.monthly_climate_summary c
 JOIN
   station_baselines b
 ON
@@ -1269,14 +1420,14 @@ ORDER BY
 
 ## Conclusion
 
-In this project, we've built a comprehensive ELT data lake solution using Apache Iceberg on Google Cloud Platform. Our implementation features:
+In this project, we've built a comprehensive ELT data lake solution using Apache Iceberg on Amazon Web Services. Our implementation features:
 
-- Modern ELT architecture that leverages BigQuery for transformations
+- Modern ELT architecture that leverages Amazon Athena for transformations
 - Apache Iceberg table format for ACID transactions and schema evolution
 - Multiple data ingestion patterns (batch and streaming)
-- Automated orchestration with Cloud Composer (Airflow)
+- Automated orchestration with Amazon MWAA (Airflow)
 - Analytics-ready views and materialized tables
-- Visualization capabilities through Looker Studio
+- Visualization capabilities through Amazon QuickSight
 
 This project provides hands-on experience with several key data engineering concepts and technologies that are in high demand in the industry today. By working with public climate data, you've created a solution that can be extended for more complex analytics use cases or as a foundation for machine learning models.
 
@@ -1299,58 +1450,60 @@ flowchart TD
     end
 
     subgraph Ingestion["Data Ingestion"]
-        CF["Cloud Functions\n(Batch Processing)"] 
-        PS["Pub/Sub\n(Streaming Ingestion)"] 
-        SCF["Cloud Functions\n(Stream Processing)"] 
+        LAMBDA["AWS Lambda\n(Batch Processing)"] 
+        SNS["Amazon SNS\n(Streaming Ingestion)"] 
+        SLAMBDA["AWS Lambda\n(Stream Processing)"] 
     end
 
     subgraph Storage["Storage Layer"]
-        GCS["Google Cloud Storage"]
+        S3["Amazon S3"]
         ICEBERG["Apache Iceberg Tables"]
+        GLUE["AWS Glue Data Catalog"]
     end
 
     subgraph Transform["Transformation Layer"]
-        BQ["BigQuery"]
+        ATHENA["Amazon Athena"]
         VIEWS["SQL Views"]
         MAT["Materialized Tables"]
     end
 
     subgraph Orchestration
-        AIRFLOW["Cloud Composer\n(Airflow)"] 
+        MWAA["Amazon MWAA\n(Airflow)"] 
     end
 
     subgraph Analytics
-        LOOKER["Looker Studio\nDashboards"]
+        QS["Amazon QuickSight\nDashboards"]
     end
 
     %% Data flow connections
-    NOAA -->|Historical Data| CF
-    STREAM -->|Real-time Data| PS
-    PS --> SCF
-    CF -->|Load Raw Data| GCS
-    SCF -->|Load Events| GCS
-    GCS <-->|Register Tables| ICEBERG
-    ICEBERG <-->|External Tables| BQ
-    BQ -->|Create| VIEWS
-    BQ -->|Create| MAT
-    VIEWS --> LOOKER
-    MAT --> LOOKER
+    NOAA -->|Historical Data| LAMBDA
+    STREAM -->|Real-time Data| SNS
+    SNS --> SLAMBDA
+    LAMBDA -->|Load Raw Data| S3
+    SLAMBDA -->|Load Events| S3
+    S3 <-->|Store Data| ICEBERG
+    ICEBERG <-->|Metadata| GLUE
+    GLUE <-->|Table Registration| ATHENA
+    ATHENA -->|Create| VIEWS
+    ATHENA -->|Create| MAT
+    VIEWS --> QS
+    MAT --> QS
     
     %% Orchestration connections
-    AIRFLOW -->|Schedule & Monitor| CF
-    AIRFLOW -->|Trigger Transformations| BQ
-    AIRFLOW -->|Maintenance Tasks| ICEBERG
+    MWAA -->|Schedule & Monitor| LAMBDA
+    MWAA -->|Trigger Transformations| ATHENA
+    MWAA -->|Maintenance Tasks| ICEBERG
 
     %% Styling
-    classDef gcp fill:#4285F4,stroke:#326CE5,stroke-width:2px,color:white;
-    classDef data fill:#0F9D58,stroke:#0B8043,stroke-width:2px,color:white;
-    classDef process fill:#DB4437,stroke:#C23321,stroke-width:2px,color:white;
-    classDef analytics fill:#F4B400,stroke:#E09C07,stroke-width:2px,color:white;
+    classDef aws fill:#FF9900,stroke:#232F3E,stroke-width:2px,color:white;
+    classDef data fill:#01A88D,stroke:#025159,stroke-width:2px,color:white;
+    classDef process fill:#C925D1,stroke:#7D1C87,stroke-width:2px,color:white;
+    classDef analytics fill:#3B48CC,stroke:#152A74,stroke-width:2px,color:white;
     
     class NOAA,STREAM data;
-    class GCS,BQ,PS,CF,SCF,AIRFLOW gcp;
+    class S3,ATHENA,SNS,LAMBDA,SLAMBDA,MWAA,GLUE aws;
     class ICEBERG,VIEWS,MAT process;
-    class LOOKER analytics;
+    class QS analytics;
 ```
 
 ## Public Datasets Information
