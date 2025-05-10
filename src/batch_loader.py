@@ -15,7 +15,7 @@ import tempfile
 import gzip
 import io
 import csv
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 
@@ -117,22 +117,55 @@ def start_query_execution(athena_client, query, database, workgroup="primary"):
 
 
 def wait_for_query_to_complete(athena_client, query_execution_id):
-    """Wait for an Athena query to complete"""
+    """
+    Wait for an Athena query to complete execution.
+    
+    Args:
+        athena_client: Boto3 Athena client
+        query_execution_id: ID of the query execution to wait for
+        
+    Returns:
+        Query execution state
+    """
     while True:
-        response = athena_client.get_query_execution(
-            QueryExecutionId=query_execution_id
-        )
+        response = athena_client.get_query_execution(QueryExecutionId=query_execution_id)
         state = response['QueryExecution']['Status']['State']
         
         if state in ['SUCCEEDED', 'FAILED', 'CANCELLED']:
-            if state == 'FAILED':
-                error_message = response['QueryExecution']['Status'].get('StateChangeReason', 'Unknown error')
-                logger.error(f"Query failed: {error_message}")
-                raise Exception(f"Athena query failed: {error_message}")
+            logger.info(f"Query {query_execution_id} finished with state {state}")
             return state
         
         logger.info(f"Query is {state}, waiting...")
-        time.sleep(5)
+        time.sleep(5)  # Wait for 5 seconds before checking again
+
+
+def execute_athena_query(athena_client, query):
+    """
+    Execute an Athena query and wait for it to complete.
+    
+    Args:
+        athena_client: Boto3 Athena client
+        query: SQL query to execute
+        
+    Returns:
+        Query execution ID if successful
+    """
+    # Get database from environment
+    namespace = os.getenv("NAMESPACE", "climate_data")
+    
+    # Start the query execution
+    query_execution_id = start_query_execution(athena_client, query, namespace)
+    
+    # Wait for query to complete
+    state = wait_for_query_to_complete(athena_client, query_execution_id)
+    
+    if state == 'SUCCEEDED':
+        return query_execution_id
+    else:
+        exception = Exception(f"Query failed with state {state}")
+        # Store the query execution ID in the exception for better error handling
+        exception.query_execution_id = query_execution_id
+        raise exception
 
 
 def download_and_upload_to_s3(url: str, bucket_name: str, key_name: str, 
@@ -353,90 +386,159 @@ def process_stations_data():
         raise
 
 
-def process_observations_chunk(chunk_data: List[Dict], year: int, month: int, chunk_counter: int, namespace: str, s3_client, athena_client) -> None:
+def process_observations_chunk(chunk_data, year, month, chunk_counter, namespace, s3_client, athena_client):
     """
-    Process and load a chunk of observations data
+    Process and load a chunk of observations data.
     
     Args:
-        chunk_data: List of observation records
-        year: Year of the data
-        month: Month of the data
-        chunk_counter: Counter for the chunk
-        namespace: Database namespace
-        s3_client: AWS S3 client
-        athena_client: AWS Athena client
+        chunk_data (list): List of observation records to process
+        year (int): Year of the observation data
+        month (int): Month of the observation data
+        chunk_counter (int): Counter for the current chunk
+        namespace (str): Namespace for the Iceberg table
+        s3_client: Boto3 S3 client
+        athena_client: Boto3 Athena client
     """
-    try:
-        # Create a temporary directory for processing
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Create dataframe from chunk
-            chunk_df = pd.DataFrame(chunk_data)
+    # Create a temporary directory for processing
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # Create a DataFrame from the chunk data
+        df = pd.DataFrame(chunk_data)
+        
+        # Make sure partition columns are present
+        if 'year' not in df.columns:
+            df['year'] = year
+        if 'month' not in df.columns:
+            df['month'] = month
+        
+        # Handle observation_time by converting to string format that Parquet can handle better
+        if 'observation_time' in df.columns:
+            # First convert to datetime using pandas
+            df['observation_time'] = pd.to_datetime(df['observation_time'], errors='coerce')
             
-            # Add partition columns if missing
-            if 'year' not in chunk_df.columns:
-                chunk_df['year'] = year
-            if 'month' not in chunk_df.columns:
-                chunk_df['month'] = month
+            # Convert timestamps to string in a format that Athena can parse correctly
+            # Use string format instead of timestamp type to avoid PyArrow type errors
+            df['observation_time_str'] = df['observation_time'].dt.strftime('%Y-%m-%d %H:%M:%S').where(~df['observation_time'].isna(), None)
             
-            # Write to temporary parquet file
-            parquet_file = os.path.join(tmpdir, f"chunk_{chunk_counter}.parquet")
-            table = pa.Table.from_pandas(chunk_df)
-            pq.write_table(table, parquet_file)
+            # Remove the original observation_time column
+            df = df.drop(columns=['observation_time'])
             
-            # Upload to S3
-            raw_bucket = os.getenv("RAW_BUCKET", "climate-lake-raw-data")
-            s3_key = f"raw/observations/year={year}/month={month}/chunk_{chunk_counter}_{int(time.time())}.parquet"
-            
-            with open(parquet_file, 'rb') as f:
-                s3_client.put_object(
-                    Bucket=raw_bucket,
-                    Key=s3_key,
-                    Body=f
-                )
-            
-            # Create a temporary table to hold the data
-            temp_table_name = f"temp_observations_{year}_{month}_{chunk_counter}_{int(time.time())}"
-            create_temp_table_query = f"""
-            CREATE EXTERNAL TABLE {namespace}.{temp_table_name} (
-                station_id STRING,
-                date DATE,
-                element STRING,
-                value DOUBLE,
-                measurement_flag STRING,
-                quality_flag STRING,
-                source_flag STRING,
-                observation_time STRING,
-                year INT,
-                month INT
-            )
-            ROW FORMAT SERDE 'org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe'
-            STORED AS INPUTFORMAT 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat'
-            OUTPUTFORMAT 'org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat'
-            LOCATION 's3://{raw_bucket}/raw/observations/year={year}/month={month}/'
-            """
-            
-            query_id = start_query_execution(athena_client, create_temp_table_query, namespace)
-            wait_for_query_to_complete(athena_client, query_id)
-            
-            # Insert the data into the Iceberg table
+            # Rename to use the string version
+            df = df.rename(columns={'observation_time_str': 'observation_time'})
+        
+        # Create temp file path
+        temp_file = os.path.join(temp_dir, f"temp_observations_{chunk_counter}.parquet")
+        
+        # Write directly to Parquet without explicit PyArrow conversion
+        df.to_parquet(temp_file, index=False)
+        
+        # Configure S3 file path
+        bucket = os.getenv("RAW_DATA_BUCKET", "climate-lake-raw-data")
+        key = f"athena/temp/year={year}/month={month}/observations_chunk_{chunk_counter}.parquet"
+        
+        # Upload file to S3
+        try:
+            s3_client.upload_file(temp_file, bucket, key)
+            logging.info(f"Uploaded chunk {chunk_counter} to s3://{bucket}/{key}")
+        except Exception as e:
+            logging.error(f"Error uploading chunk {chunk_counter}: {e}")
+            raise
+        
+        # Get database namespace from environment to make sure it's used consistently
+        actual_namespace = os.getenv("NAMESPACE", "climate_data")
+        
+        # Create a temporary table in Athena
+        temp_table_name = f"{actual_namespace}.temp_observations_{year}_{month}_{chunk_counter}"
+        s3_location = f"s3://{bucket}/athena/temp/year={year}/month={month}/"
+        
+        logging.info(f"Creating temp table {temp_table_name} at location {s3_location}")
+        
+        # First, drop the temp table if it exists
+        drop_table_query = f"DROP TABLE IF EXISTS {temp_table_name};"
+        try:
+            logging.info(f"Dropping temp table if it exists: {drop_table_query}")
+            execute_athena_query(athena_client, drop_table_query)
+        except Exception as e:
+            logging.warning(f"Error dropping temp table: {e}. Will proceed with table creation.")
+        
+        create_table_query = f"""
+        CREATE EXTERNAL TABLE {temp_table_name} (
+            station_id STRING,
+            date DATE,
+            element STRING,
+            value DOUBLE,
+            measurement_flag STRING,
+            quality_flag STRING,
+            source_flag STRING,
+            observation_time STRING,
+            year INT,
+            month INT
+        )
+        STORED AS PARQUET
+        LOCATION '{s3_location}';
+        """
+        
+        # Execute the create table query
+        try:
+            # Print the actual query being executed to debug
+            logging.info(f"Executing query: {create_table_query}")
+            execute_athena_query(athena_client, create_table_query)
+            logging.info(f"Created temporary table {temp_table_name}")
+        except Exception as e:
+            # Get more detailed information if possible
+            logging.error(f"Error creating temporary table: {e}")
+            try:
+                # Try to get the full error details
+                response = athena_client.get_query_execution(
+                    QueryExecutionId=getattr(e, 'query_execution_id', ''))
+                if 'QueryExecution' in response and 'Status' in response['QueryExecution']:
+                    state_change_reason = response['QueryExecution']['Status'].get('StateChangeReason', 'No details available')
+                    logging.error(f"Athena error details: {state_change_reason}")
+            except:
+                logging.error("Could not retrieve detailed Athena error information")
+            raise
+        
+        # Insert data into Iceberg table
+        try:
             insert_query = f"""
-            INSERT INTO {namespace}.observations
-            SELECT * FROM {namespace}.{temp_table_name}
+            INSERT INTO {actual_namespace}.observations
+            SELECT
+                station_id,
+                date,
+                element,
+                value,
+                measurement_flag,
+                quality_flag,
+                source_flag,
+                -- Cast the string timestamp back to a proper timestamp for the Iceberg table
+                CAST(observation_time AS TIMESTAMP) as observation_time,
+                year,
+                month
+            FROM {temp_table_name};
             """
             
-            query_id = start_query_execution(athena_client, insert_query, namespace)
-            wait_for_query_to_complete(athena_client, query_id)
+            # Print the actual query being executed to debug
+            logging.info(f"Executing insert query: {insert_query}")
+            
+            # Execute the insert query
+            result = execute_athena_query(athena_client, insert_query)
+            logging.info(f"Inserted {len(df)} records into Iceberg table")
             
             # Drop the temporary table
-            drop_query = f"DROP TABLE IF EXISTS {namespace}.{temp_table_name}"
-            query_id = start_query_execution(athena_client, drop_query, namespace)
-            wait_for_query_to_complete(athena_client, query_id)
-            
-            logger.info(f"Inserted chunk {chunk_counter} with {len(chunk_data)} records into Iceberg table")
-            
-    except Exception as e:
-        logger.error(f"Error processing observations chunk: {e}")
-        raise
+            drop_table_query = f"DROP TABLE {temp_table_name};"
+            execute_athena_query(athena_client, drop_table_query)
+            logging.info(f"Dropped temporary table {temp_table_name}")
+        except Exception as e:
+            logging.error(f"Error inserting data into Iceberg table: {e}")
+            try:
+                # Try to get the full error details
+                response = athena_client.get_query_execution(
+                    QueryExecutionId=getattr(e, 'query_execution_id', ''))
+                if 'QueryExecution' in response and 'Status' in response['QueryExecution']:
+                    state_change_reason = response['QueryExecution']['Status'].get('StateChangeReason', 'No details available')
+                    logging.error(f"Athena error details: {state_change_reason}")
+            except:
+                logging.error("Could not retrieve detailed Athena error information")
+            raise
 
 
 def process_observations_data(year: int, stations_df: Optional[pd.DataFrame] = None) -> int:
@@ -515,6 +617,26 @@ def process_observations_data(year: int, stations_df: Optional[pd.DataFrame] = N
                 except (ValueError, IndexError):
                     continue
                 
+                # Process observation_time - convert to timestamp if it exists
+                observation_time_str = row[7] if row[7] else None
+                observation_time = None
+                if observation_time_str:
+                    try:
+                        # Handle special case of '2400' observation time (midnight)
+                        if observation_time_str == '2400':
+                            # Convert to next day at 00:00
+                            next_day = date_obj + timedelta(days=1)
+                            timestamp_str = f"{next_day.year}-{next_day.month:02d}-{next_day.day:02d} 00:00"
+                        else:
+                            # Assuming the time is in 'HH:MM' format
+                            # Create full timestamp using the date and time
+                            timestamp_str = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]} {observation_time_str}"
+                        
+                        observation_time = pd.Timestamp(timestamp_str)
+                    except ValueError:
+                        # If parsing fails, keep as None
+                        logger.warning(f"Could not parse observation time: {observation_time_str}")
+                
                 # Add record to chunk
                 chunk_data.append({
                     'station_id': row[0],
@@ -524,7 +646,7 @@ def process_observations_data(year: int, stations_df: Optional[pd.DataFrame] = N
                     'measurement_flag': row[4] if row[4] else None,
                     'quality_flag': row[5] if row[5] else None,
                     'source_flag': row[6] if row[6] else None,
-                    'observation_time': row[7] if row[7] else None,
+                    'observation_time': observation_time,
                     'year': year_val,
                     'month': month_val
                 })

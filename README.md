@@ -4,7 +4,7 @@
 
 This project implements a modern data lake architecture using Apache Iceberg on Amazon Web Services (AWS). The focus is on Extract-Load-Transform (ELT) rather than ETL, leveraging Amazon Athena's powerful transformation capabilities while maintaining data lake flexibility with Iceberg.
 
-We'll use public climate data from NOAA to build a comprehensive data platform that showcases AWS services integration with Iceberg table format.
+We use public climate data from NOAA to build a comprehensive data platform that showcases AWS services integration with Iceberg table format.
 
 ## Getting Started
 
@@ -81,8 +81,8 @@ aws s3 mb s3://climate-lake-raw-data --region ap-southeast-2
 # Create an S3 bucket for Iceberg tables
 aws s3 mb s3://climate-lake-iceberg-tables --region ap-southeast-2
 
-# Create an S3 bucket for Iceberg catalog
-aws s3 mb s3://climate-lake-iceberg-catalog --region ap-southeast-2
+# Create an S3 bucket for Athena query results
+aws s3 mb s3://climate-lake-athena-results --region ap-southeast-2
 
 # Create an AWS Glue Database for Iceberg tables
 aws glue create-database --database-input '{"Name":"climate_catalog"}' --region ap-southeast-2
@@ -111,17 +111,19 @@ This command will create the necessary tables in AWS Glue Data Catalog and confi
 ├── pyproject.toml                # Project dependencies (for uv)
 ├── src                           # Source code
 │   ├── batch_loader.py           # Extract and load historical climate data
-│   ├── stream_processor.py       # Process real-time climate data
+│   ├── stream_processor.py       # Process real-time climate data from SQS
 │   ├── iceberg_setup.py          # Set up Iceberg catalog and tables
-│   ├── main.py                   # Cloud Function entry points
-│   └── climate_data_dag.py       # Airflow DAG for orchestration
+│   ├── test_iceberg_tables.py    # Tests for Iceberg tables functionality
+│   └── data/                     # Sample test data for local development
+├── nessie_warehouse/             # Configuration for Project Nessie (empty)
+├── local_warehouse/              # Local warehouse configuration (empty)
 └── test                          # Test code
     ├── integration_test          # Integration tests
     │   ├── test_batch_loader.py  # Tests for batch loader
     │   └── test_stream_processor.py # Tests for stream processor
     └── unit_test                 # Unit tests
         ├── test_iceberg_setup.py # Tests for Iceberg setup
-        └── test_main.py          # Tests for Cloud Functions
+        └── test_main.py          # Tests for Lambda Functions
 ```
 
 ## Requirements and Dependencies
@@ -130,23 +132,20 @@ This command will create the necessary tables in AWS Glue Data Catalog and confi
 - Amazon S3
 - Amazon Athena
 - Amazon Glue
-- Amazon Cloud Functions
-- Amazon Cloud Pub/Sub
-- Amazon Cloud Composer (Airflow)
-- Amazon Cloud Scheduler
+- AWS Lambda
+- Amazon SQS
+- Amazon EventBridge
+- Amazon Managed Workflows for Apache Airflow (MWAA)
 
 ### Python Dependencies
 - Python 3.8+
-- pyiceberg (<=0.9.1)
+- boto3
 - pandas
 - pyarrow
-- google-cloud-storage
-- google-cloud-bigquery
-- google-cloud-pubsub
-- google-cloud-functions
 - requests
 - python-dotenv
 - apache-airflow
+- pyiceberg[s3,glue]
 
 ## Local Development Setup
 
@@ -169,8 +168,8 @@ source .venv/bin/activate
 # Initialize the project using pyproject.toml
 uv pip install -e .
 
-# Install PyIceberg with S3 and Glue support
-uv pip install 'pyiceberg[s3,glue]<=0.9.1'
+# Install boto3 for AWS access
+uv pip install boto3
 ```
 
 ### Setting Up Environment Variables
@@ -215,7 +214,7 @@ aws configure
 # Create S3 buckets for the data lake zones
 aws s3 mb s3://climate-lake-raw-data --region ap-southeast-2
 aws s3 mb s3://climate-lake-iceberg-tables --region ap-southeast-2
-aws s3 mb s3://climate-lake-iceberg-catalog --region ap-southeast-2
+aws s3 mb s3://climate-lake-athena-results --region ap-southeast-2
 
 # Create an AWS Glue Database for Iceberg tables
 aws glue create-database --database-input '{"Name":"climate_catalog"}' --region ap-southeast-2
@@ -240,7 +239,6 @@ The Iceberg table setup is being implemented in phases:
 
 1. **Mock Mode**: For early development and testing without creating actual resources
 2. **AWS Athena Integration**: Creating proper Iceberg tables using Athena (current implementation)
-3. **PyIceberg with Glue**: Future integration using PyIceberg's native AWS Glue catalog support
 
 To run in mock mode (for testing without AWS access):
 
@@ -268,6 +266,84 @@ SELECT station_id, date, element, value
 FROM climate_data.observations 
 WHERE year = 2022 AND month = 1
 LIMIT 10;
+```
+
+### Accessing Iceberg Tables From Other Query Engines
+
+One of the key benefits of Apache Iceberg is its ability to work with multiple query engines beyond just AWS Athena. Here are some options:
+
+#### Apache Spark
+
+```python
+# Configure Spark to access Iceberg tables in AWS Glue
+spark = (SparkSession.builder
+    .config("spark.sql.catalog.glue_catalog", "org.apache.iceberg.spark.SparkCatalog")
+    .config("spark.sql.catalog.glue_catalog.warehouse", "s3://climate-lake-iceberg-tables")
+    .config("spark.sql.catalog.glue_catalog.catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog")
+    .config("spark.sql.catalog.glue_catalog.io-impl", "org.apache.iceberg.aws.s3.S3FileIO")
+    .getOrCreate())
+
+# Read from Iceberg table
+df = spark.read.format("iceberg").load("glue_catalog.climate_data.stations")
+df.show()
+
+# Write to Iceberg table
+df.write.format("iceberg").save("glue_catalog.climate_data.new_table")
+```
+
+#### Trino (formerly PrestoSQL)
+
+```properties
+# Add to your Trino catalog properties
+connector.name=iceberg
+iceberg.catalog.type=glue
+hive.metastore.glue.region=ap-southeast-2
+```
+
+Then query with SQL:
+```sql
+SELECT * FROM glue_catalog.climate_data.stations LIMIT 10;
+```
+
+#### Flink
+
+```java
+// Configure Flink catalog
+Map<String, String> properties = new HashMap<>();
+properties.put("warehouse", "s3://climate-lake-iceberg-tables");
+properties.put("catalog-impl", "org.apache.iceberg.aws.glue.GlueCatalog");
+properties.put("io-impl", "org.apache.iceberg.aws.s3.S3FileIO");
+
+TableEnvironment tEnv = TableEnvironment.create(EnvironmentSettings.inStreamingMode());
+tEnv.executeSql("CREATE CATALOG glue_catalog WITH (" +
+    "'type'='iceberg', " +
+    "'warehouse'='s3://climate-lake-iceberg-tables', " +
+    "'catalog-impl'='org.apache.iceberg.aws.glue.GlueCatalog', " +
+    "'io-impl'='org.apache.iceberg.aws.s3.S3FileIO'" +
+    ")");
+
+// Query Iceberg tables
+tEnv.executeSql("SELECT * FROM glue_catalog.climate_data.stations LIMIT 10").print();
+```
+
+#### Project Nessie Integration
+
+[Project Nessie](https://projectnessie.org/) adds Git-like version control to Iceberg tables:
+
+```bash
+# Set up Nessie server (locally using Docker)
+docker run -p 19120:19120 projectnessie/nessie
+
+# Configure Spark with Nessie
+spark = (SparkSession.builder
+    .config("spark.sql.catalog.nessie_catalog", "org.apache.iceberg.spark.SparkCatalog")
+    .config("spark.sql.catalog.nessie_catalog.warehouse", "s3://climate-lake-iceberg-tables")
+    .config("spark.sql.catalog.nessie_catalog.catalog-impl", "org.apache.iceberg.nessie.NessieCatalog")
+    .config("spark.sql.catalog.nessie_catalog.uri", "http://localhost:19120/api/v1")
+    .getOrCreate())
+
+# Use Nessie branches for version control
+spark.sql("CREATE TABLE nessie_catalog.climate_data.test (id INT)")
 ```
 
 ### How the Iceberg Tables are Created
@@ -311,9 +387,18 @@ Note: By default, the batch loader will use the previous year if no year is spec
 
 ### Testing the Stream Processor
 
+The stream processor is designed to handle real-time climate data events received through AWS SQS. For local testing:
+
 ```bash
-# Process a test message (simulates Pub/Sub event)
+# Process a test message (simulates SQS event)
 python -m src.stream_processor --test
+
+# Process a message from a sample JSON file
+# Several example files are provided in the src/data directory:
+python -m src.stream_processor --input-file src/data/temperature_reading.json
+python -m src.stream_processor --input-file src/data/precipitation_reading.json
+python -m src.stream_processor --input-file src/data/snow_reading.json
+python -m src.stream_processor --input-file src/data/wind_reading.json
 ```
 
 ## Testing
@@ -345,7 +430,7 @@ pytest test/integration_test/test_batch_loader.py
 - Station data in fixed-width format
 - Observation data in CSV format
 
-### Streaming Input (Pub/Sub Message)
+### Streaming Input (SQS Message)
 JSON format with the following schema:
 ```json
 {
@@ -361,9 +446,9 @@ JSON format with the following schema:
 ```
 
 ### Output Data Structure
-- Apache Iceberg tables with Parquet file format
-- BigQuery views and materialized tables for analytics
-- Transformation results accessible through SQL queries
+- Apache Iceberg tables with Parquet file format in S3
+- Data accessible through AWS Athena for SQL queries
+- Partitioned by year and month for efficient querying
 
 ## License
 
@@ -371,103 +456,87 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ## Troubleshooting
 
-### PyIceberg Version Issues
+### AWS Credentials Issues
 
-The project currently requires PyIceberg <=0.9.1 (the latest available version). 
-This may cause some compatibility issues with the code which was originally written for a newer version.
+If you encounter errors related to AWS credentials:
 
-#### SQLAlchemy Support for In-Memory Catalog
-
-If you see this error:
-```
-Error setting up Iceberg catalog: SQLAlchemy support not installed: pip install 'pyiceberg[sql-sqlite]'
-```
-
-There are several conflicting dependencies. The recommended workaround is to modify `src/iceberg_setup.py` to use a simple file-based approach for local development.
-
-For a quick workaround in local development, you can create a mock catalog that stores data locally:
-
-```python
-def create_catalog_config() -> Dict[str, str]:
-    """Create simple file-based catalog configuration for local development"""
-    try:
-        # For local development, we'll use a local path
-        warehouse_path = os.path.join(parent_dir, "local_warehouse")
-        os.makedirs(warehouse_path, exist_ok=True)
-        
-        catalog_config = {
-            "type": "in-memory",
-            "warehouse": warehouse_path,
-        }
-        return catalog_config
-    except Exception as e:
-        logger.error(f"Error creating catalog config: {e}")
-        raise
-```
-
-**Note**: This is only for local development and testing. For production GCP deployment, you would need to configure a proper catalog.
-
-### Missing Hive Support Error
-
-If you see this error:
-```
-Error setting up Iceberg catalog: Apache Hive support not installed: pip install 'pyiceberg[hive]'
-```
-
-Install the Hive extras for PyIceberg:
-```bash
-source .venv/bin/activate
-uv pip install 'pyiceberg[hive]<=0.9.1'
-```
-
-### Required Dependencies
-
-For local development, you may need:
-```bash
-# Install everything needed for local development
-source .venv/bin/activate
-uv pip install 'pyiceberg[hive,sql-sqlite]<=0.9.1' 'sqlalchemy<2.0.0'
-```
-
-### URI Required Error
-
-If you see this error:
-```
-Error setting up Iceberg catalog: 'uri'
-```
-
-There are two options to address this:
-
-1. Use an in-memory catalog for local development:
-```python
-catalog_config = {
-    "type": "in-memory",
-    "warehouse": f"gs://{os.getenv('ICEBERG_TABLES_BUCKET', 'climate-lake-iceberg-tables')}",
-    "io-impl": "org.apache.iceberg.gcp.gcs.GCSFileIO",
-    "credential": "gcp",
-    "region": os.getenv("GCP_REGION", "australia-southeast1"),
-}
-```
-
-2. If you need a persistent Hive catalog, you'll need to set up a Hive metastore service and update the URI:
-```python
-catalog_config = {
-    "type": "hive",
-    "uri": "thrift://your-hive-metastore:9083",
-    "warehouse": f"gs://{os.getenv('ICEBERG_TABLES_BUCKET', 'climate-lake-iceberg-tables')}",
-    "io-impl": "org.apache.iceberg.gcp.gcs.GCSFileIO",
-    "credential": "gcp",
-    "region": os.getenv("GCP_REGION", "australia-southeast1"),
-}
-```
-
-### Common Errors
-
-1. **Import errors**: Ensure you're using the correct import paths for your PyIceberg version.
-
-2. **Credential issues**: Make sure your GCP credentials are set correctly:
+1. **Ensure your AWS CLI is properly configured**:
    ```bash
-   export GOOGLE_APPLICATION_CREDENTIALS=/path/to/your/credentials.json
+   aws configure
+   # Enter your access key, secret key, and preferred region
    ```
 
-3. **Missing buckets**: Ensure you've created all required GCS buckets before running the setup script.
+2. **Check environment variables**:
+   Make sure your `.env` file contains the correct AWS configuration.
+
+3. **IAM permissions**:
+   Ensure your IAM user/role has the necessary permissions for S3, Athena, and Glue.
+
+### Athena Query Errors
+
+If Athena queries fail:
+
+1. **Check your Athena query results bucket**:
+   Verify that the `climate-lake-athena-results` bucket exists and that you have write permissions.
+
+2. **Examine query logs**:
+   Check the Athena query execution details in the AWS console for specific error messages.
+
+3. **Verify database and table names**:
+   Ensure that your `.env` file has the correct `NAMESPACE` and `CATALOG_NAME` values.
+
+### SQS Stream Processing Issues
+
+If the stream processor is not working:
+
+1. **Make sure Iceberg tables are set up first**:
+   ```bash
+   # Set up Iceberg tables before running the stream processor
+   python -m src.iceberg_setup
+   ```
+   The stream processor requires the `observations` Iceberg table to exist.
+
+2. **Verify boto3 installation**:
+   ```bash
+   pip install boto3
+   ```
+
+3. **Check SQS message format**:
+   Ensure your messages match the expected JSON format.
+
+4. **Run with increased logging**:
+   ```bash
+   LOG_LEVEL=DEBUG python -m src.stream_processor --test
+   ```
+
+5. **Check Athena query logs**:
+   If your stream processing fails at the Athena query stage, check the query logs in the AWS console to see the specific error message.
+
+### Batch Loader Issues
+
+If the batch loader fails:
+
+1. **Check network connectivity**:
+   Ensure you can reach the NOAA data sources.
+
+2. **Verify S3 buckets exist**:
+   Confirm all required S3 buckets are created.
+
+3. **Examine temporary directories**:
+   Check if temporary files are being created and processed correctly.
+
+### Iceberg Integration with Other Query Engines
+
+If you have trouble connecting other query engines to your Iceberg tables:
+
+1. **Check catalog configuration**:
+   Ensure you're using the right catalog implementation (`org.apache.iceberg.aws.glue.GlueCatalog` for AWS Glue).
+
+2. **Verify AWS region**:
+   Make sure you're using the correct AWS region in your configuration.
+
+3. **Check S3 access**:
+   Ensure your query engine has proper access to the S3 bucket containing the Iceberg data.
+
+4. **Review table name format**:
+   Different engines may require different formats for referencing tables (catalog.database.table).
