@@ -1,4 +1,4 @@
-# Real-time Climate Data Analytics Platform with ELT on AWS
+# Real-time Climate Data Analytics Platform with ELT and Apache Iceberg on AWS
 
 ## Overview
 
